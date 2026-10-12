@@ -1,0 +1,194 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "session-start"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "pre-edit"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "mark-dirty"
+            ],
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "capture-plan"
+            ],
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "TodoWrite|TaskCreate|TaskUpdate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "capture-steps"
+            ],
+            "timeout": 3,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "flush"
+            ],
+            "timeout": 10,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "subagent",
+              "--start"
+            ],
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "subagent",
+              "--stop"
+            ],
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "flush",
+              "--final"
+            ],
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "flush",
+              "--final",
+              "--headless"
+            ],
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "resume-watch"
+            ],
+            "timeout": 3600,
+            "async": true,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/php/php",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hive.php",
+              "session-end"
+            ],
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

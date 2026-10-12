@@ -1,0 +1,14 @@
+{
+  "name": "velu",
+  "owner": {
+    "name": "Velu Media"
+  },
+  "description": "Velu Hive for Claude Code",
+  "plugins": [
+    {
+      "name": "velu-hive",
+      "source": "./plugin",
+      "description": "Velu Hive: see what other agents are editing before you collide"
+    }
+  ]
+}
