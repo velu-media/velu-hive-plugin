@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.17.1';
+const HIVE_VERSION = '1.17.2';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -912,6 +912,17 @@ const HIVE_SETUP_CODE_REJECTED = 'This setup code is invalid, expired or already
 | Never plan-sync or publish, which the hooks start detached themselves.
 */
 const HIVE_SETUP_HOOK_VERBS = ['session-start', 'pre-edit', 'mark-dirty', 'flush', 'session-end', 'statusline', 'capture-plan', 'capture-steps', 'resume-watch', 'subagent'];
+/*
+| Every hook verb: the ones hooks run, and the ones they start detached
+| (publish, plan-sync, plan-file). Their stdout is a protocol, never a
+| report. A hook verb is never removed or renamed, only turned into a
+| silent no-op: an older plugin's hooks.json still sends it, and an older
+| copy hands it to the newest installed one (hive_plugin_forward()).
+*/
+const HIVE_HOOK_VERBS = [
+    'session-start', 'pre-edit', 'mark-dirty', 'flush', 'session-end', 'statusline', 'publish',
+    'capture-plan', 'capture-steps', 'resume-watch', 'plan-sync', 'subagent', 'plan-file',
+];
 /*
 | The Velu Hive plugin for Claude Code (client 1.14.0, SECTION 35): the
 | marketplace `velu`, the plugin `velu-hive` in it, so its id and the name
@@ -1756,6 +1767,14 @@ function hive_main(array $argv): int
         return hive_verb_usage_headers();
     }
 
+    // A copy of an older plugin version, which a Claude Code window opened
+    // before the update still runs: the newest installed copy answers
+    // instead (SECTION 35, hive_plugin_forward()). Null runs this one.
+    $forwarded = hive_plugin_forward($argv);
+    if ($forwarded !== null) {
+        return $forwarded;
+    }
+
     register_shutdown_function(static function () {
         $fatal = error_get_last();
         if ($fatal !== null && in_array($fatal['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
@@ -1773,10 +1792,7 @@ function hive_main(array $argv): int
     // Verbs a human runs interactively are allowed to report their own errors;
     // hook verbs are not, because their stdout is a protocol. `publish` runs
     // detached, with nobody to read anything it says.
-    $isHookVerb = in_array($verb, [
-        'session-start', 'pre-edit', 'mark-dirty', 'flush', 'session-end', 'statusline', 'publish',
-        'capture-plan', 'capture-steps', 'resume-watch', 'plan-sync', 'subagent', 'plan-file',
-    ], true);
+    $isHookVerb = in_array($verb, HIVE_HOOK_VERBS, true);
 
     // The organisation's policy for Claude Code switched the plugin off
     // (managed settings): Hive is off in every mode, as Claude Code keeps
@@ -15324,7 +15340,7 @@ function hive_usage_plugin_not_ready(): ?string
         return 'the Velu Hive plugin is not installed here yet';
     }
     $head = @file_get_contents($root.'/scripts/hive.php', false, null, 0, 262144);
-    if (! is_string($head) || preg_match("/^const HIVE_VERSION = '([0-9][0-9A-Za-z.+-]{0,30})';$/m", $head, $m) !== 1) {
+    if (! is_string($head) || preg_match("/^const HIVE_VERSION = '([0-9][0-9A-Za-z.+-]{0,30})';\r?$/m", $head, $m) !== 1) {
         return 'the version of the Velu Hive plugin installed here is not known';
     }
 
@@ -41116,7 +41132,12 @@ const HIVE_WORKPLAN_DATA_NOTE = 'Titles and names above come from teammates thro
 /**
  * One workplan of GET /progress/workplans, on one line: key and title, the
  * author (a teammate's), its state, each repository part with its lanes and
- * mother, how far it is, and Hive's decisions today.
+ * mother, how far it is, the plans a board represents, and Hive's decisions
+ * today. How far is done of live, as the team's board counts it: "19 of 21
+ * tasks done", and ", 2 in the mother" only when some are stacked there
+ * (tasks.done and tasks.live; from a server before 14 Oct 2026, stacked plus
+ * merged of the total). A part with no mother in play has no mother words:
+ * the server sends none.
  *
  * @param  array<string, mixed>  $row
  */
@@ -41143,14 +41164,30 @@ function hive_workplan_row(array $row, bool $teammate): string
     $int = static fn (array $from, string $key): int => is_int($from[$key] ?? null) ? $from[$key] : 0;
     $running = $int($lanes, 'running');
     $decided = $int($row, 'decided_today');
+    $stacked = $int($tasks, 'stacked');
+    $done = is_int($tasks['done'] ?? null) ? $tasks['done'] : $stacked + $int($tasks, 'merged');
+    $live = is_int($tasks['live'] ?? null) ? $tasks['live'] : $int($tasks, 'total');
+    $plans = hive_workplan_plan_keys($row['plans'] ?? null);
 
     return '- '.$key.($title !== '' ? ' "'.$title.'"' : '').($teammate && $author !== '' ? ' by '.$author : '')
         .' · '.hive_enum($row['state'] ?? null, ['draft', 'published', 'done', 'archived'], 'published')
         .($parts !== [] ? ' · '.implode(', ', $parts) : '')
-        .' · '.$int($tasks, 'stacked').' of '.$int($tasks, 'total').' tasks in the mother'
+        .' · '.$done.' of '.$live.' task'.($live === 1 ? '' : 's').' done'.($stacked > 0 ? ', '.$stacked.' in the mother' : '')
+        .($plans !== [] ? ' · plans: '.implode(', ', $plans) : '')
         .' · '.$running.' lane'.($running === 1 ? '' : 's').' running · '.$int($lanes, 'free').' free'
         .(is_int($row['left_minutes'] ?? null) ? ' · about '.hive_workplan_minutes($row['left_minutes']).' left' : '')
         .($decided > 0 ? ' · Hive decided '.$decided.' time'.($decided === 1 ? '' : 's').' today, '.$int($row, 'people_today').' needed a person' : '');
+}
+
+/**
+ * The plans a board represents, as the server names them (since 14 Oct
+ * 2026): workplan keys only, at most eight; anything else is dropped.
+ *
+ * @return list<string>
+ */
+function hive_workplan_plan_keys($plans): array
+{
+    return array_values(array_filter(array_slice(is_array($plans) ? array_values($plans) : [], 0, 8), static fn ($key): bool => is_string($key) && hive_is_workplan_key($key)));
 }
 
 /** "40 min", "1.5 h", "7 h", "12 h". */
@@ -41500,9 +41537,15 @@ function hive_workplan_lane_lines(array $view, string $cmd): array
         }
     }
     $preview = is_int($view['preview'] ?? null) ? $view['preview'] : null;
+    $plans = hive_workplan_plan_keys($view['plans'] ?? null);
     $lines = ['HIVE LANES '.$key.($title !== '' ? ' "'.$title.'"' : '').' ('.$state.') · '.$count.' task'.($count === 1 ? '' : 's')
         .(is_int($view['left_minutes'] ?? null) ? ' · about '.hive_workplan_minutes($view['left_minutes']).' left' : '')
-        .($preview !== null ? ' · a preview for '.$preview.' agent'.($preview === 1 ? '' : 's').': nothing was changed' : '')];
+        .($preview !== null ? ' · a preview for '.$preview.' agent'.($preview === 1 ? '' : 's').': nothing was changed' : '')
+        .($plans !== [] ? ' · plans: '.implode(', ', $plans) : '')];
+    // A plan the team's board links, which nobody works in Hive's lanes (since 14 Oct 2026).
+    if (is_string($view['represented_by'] ?? null) && hive_is_workplan_key($view['represented_by'])) {
+        $lines[] = 'The team\'s board '.$view['represented_by'].' links this plan: its work is counted there, and none of this plan\'s tasks is offered as work.';
+    }
 
     foreach ($repos as $part) {
         $lanes = array_values(array_filter(is_array($part['lanes'] ?? null) ? array_slice($part['lanes'], 0, 8) : [], 'is_array'));
@@ -41517,15 +41560,21 @@ function hive_workplan_lane_lines(array $view, string $cmd): array
             continue;
         }
         $repo = $part['repo'];
+        // No mother in play there (since 14 Oct 2026: nobody took, pushed or
+        // opened a pull request on a lane): where its work merges, no mother.
+        $into = ($part['mother_in_play'] ?? true) === false
+            ? 'into '.(is_string($part['integration_branch'] ?? null) && $part['integration_branch'] !== '' ? hive_safe_text($part['integration_branch'], HIVE_SAFE_BRANCH_MAX) : 'its integration branch')
+            : null;
         if (($part['single_lane'] ?? false) === true && isset($lanes[0])) {
             [$branch, $tail] = hive_workplan_lane_words($lanes[0]);
-            $lines[] = $repo.' · one lane, no separate mother · '.$branch.': '.$tail;
+            $lines[] = $repo.' · '.($into ?? 'one lane, no separate mother').' · '.$branch.': '.$tail;
             $lines = array_merge($lines, hive_workplan_lane_notes($lanes[0], '  '));
 
             continue;
         }
         $mother = is_array($part['mother'] ?? null) ? $part['mother'] : [];
-        $lines[] = $repo.' · mother '.hive_safe_text($mother['branch'] ?? null, HIVE_SAFE_BRANCH_MAX).' ('.hive_workplan_mother_words($mother).')';
+        $lines[] = $into !== null ? $repo.' · '.$into
+            : $repo.' · mother '.hive_safe_text($mother['branch'] ?? null, HIVE_SAFE_BRANCH_MAX).' ('.hive_workplan_mother_words($mother).')';
         foreach ($lanes as $lane) {
             [$branch, $tail] = hive_workplan_lane_words($lane);
             $letter = is_string($lane['letter'] ?? null) && hive_is_lane_letter($lane['letter']) ? $lane['letter'] : '?';
@@ -41582,7 +41631,9 @@ function hive_workplan_mother_words(array $mother): string
 
 /**
  * One lane in words: its branch, and "RSL-T1 then RSL-T5 · free · startable
- * now" -- who holds it, and where its first open task stands.
+ * now" -- who holds it, and where its first open task stands; once every
+ * task is done, "in the mother branch" while one is stacked there, else
+ * "merged".
  *
  * @param  array<string, mixed>  $lane
  * @return array{0: string, 1: string}
@@ -41611,8 +41662,13 @@ function hive_workplan_lane_words(array $lane): array
     }
 
     $where = null;
+    $stacked = false;
+    $merged = false;
     foreach ($tasks as $task) {
         if (in_array($task['band'] ?? null, ['merged', 'dropped'], true) || ($task['activity'] ?? null) === 'stacked') {
+            $stacked = $stacked || ($task['activity'] ?? null) === 'stacked';
+            $merged = $merged || ($task['band'] ?? null) === 'merged';
+
             continue;
         }
         if (($task['band'] ?? null) === 'in_flight') {
@@ -41626,8 +41682,11 @@ function hive_workplan_lane_words(array $lane): array
         }
         break;
     }
+    // Every task done: in the mother branch while one is stacked there,
+    // else merged -- into develop, as a team without mothers merges -- and
+    // nothing more for a lane whose every task was dropped.
     if ($where === null && $tasks !== []) {
-        $where = 'in the mother branch';
+        $where = $stacked ? 'in the mother branch' : ($merged ? 'merged' : null);
     }
 
     return [
@@ -52363,15 +52422,19 @@ function hive_plugin_enabled_value(): ?bool
 
 /**
  * The folder installed_plugins.json names for the plugin's user install, or,
- * only when that file is missing or does not parse, the pointer's. Records
- * that parse and name no user install mean "not installed": an uninstall
- * leaves every old version in the cache, which the pointer may still name.
+ * only when that file is missing or does not parse, the pointer's (unless
+ * $orPointer is false). Records that parse and name no user install mean
+ * "not installed": an uninstall leaves every old version in the cache, which
+ * the pointer may still name.
  */
-function hive_plugin_candidate_root(): ?string
+function hive_plugin_candidate_root(bool $orPointer = true): ?string
 {
     $records = hive_read_json(hive_plugin_records_file());
 
     if ($records === null) {
+        if (! $orPointer) {
+            return null;
+        }
         $pointer = @file_get_contents(hive_plugin_pointer_file());
         $pointer = is_string($pointer) ? trim($pointer) : '';
 
@@ -52411,9 +52474,31 @@ function hive_plugin_under_cache(string $path): bool
 }
 
 /**
+ * Does $path, followed through every link, lie inside this plugin's own
+ * folder of the cache, <cache>/velu/velu-hive, where Claude Code keeps its
+ * versions? Another plugin's folder in the cache is not Hive's.
+ */
+function hive_plugin_under_own_cache(string $path): bool
+{
+    $own = realpath(hive_plugin_cache_dir().'/'.HIVE_PLUGIN_MARKETPLACE.'/'.explode('@', HIVE_PLUGIN_ID)[0]);
+    $real = realpath($path);
+    if ($own === false || $real === false) {
+        return false;
+    }
+
+    $prefix = hive_normalise_slashes($own).'/';
+    $real = hive_normalise_slashes($real);
+
+    return PHP_OS_FAMILY === 'Windows'
+        ? strncasecmp($real, $prefix, strlen($prefix)) === 0
+        : strncmp($real, $prefix, strlen($prefix)) === 0;
+}
+
+/**
  * The installed plugin's folder, as the loader finds it: the candidate whose
- * scripts/hive.php is a file under the cache by realpath. Under the plugins
- * root is not enough: data/ is there too, and anything may write to it.
+ * scripts/hive.php is a file under the plugin's own folder of the cache by
+ * realpath. Under the plugins root is not enough: data/ is there too, and
+ * anything may write to it; nor is another plugin's folder of the cache.
  */
 function hive_plugin_installed_root(): ?string
 {
@@ -52424,7 +52509,84 @@ function hive_plugin_installed_root(): ?string
 
     $client = $root.'/scripts/hive.php';
 
-    return is_file($client) && hive_plugin_under_cache($client) ? $root : null;
+    return is_file($client) && hive_plugin_under_own_cache($client) ? $root : null;
+}
+
+/**
+ * Hands this call to the newest installed copy of the plugin, when this
+ * process is an older one (RJ, 14 Oct 2026): Claude Code keeps every
+ * version in a folder of its own, and a window opened before an update runs
+ * the old folder's hook commands until it is restarted. Only a hook verb
+ * (HIVE_HOOK_VERBS), and only under the loader's own checks: as a copy in
+ * the plugin cache (not through the loader, which runs the installed copy
+ * already), the installPath installed_plugins.json names for the user
+ * install (never the pointer), a file under the plugin's own folder of the
+ * cache by realpath, a strictly newer HIVE_VERSION, the plugin on and no
+ * policy turning it off (hive_plugin_enabled_value() asks both), and never
+ * twice (HIVE_FORWARDED on the child). The newer copy runs as a child
+ * process -- a `require` would declare every function twice -- with the
+ * same arguments, this process's stdin, stdout and stderr. Its answer is
+ * its exit code when it exited by itself with 0 or 2, else 0: a hook verb
+ * never blocks an edit by accident, so a child killed by a signal, or one
+ * that failed, says nothing. Null when it does not hand the call on, or
+ * cannot: this copy runs, as before. When this is the copy the records
+ * name, it reads that one file.
+ *
+ * @param  list<string>  $argv
+ */
+function hive_plugin_forward(array $argv): ?int
+{
+    try {
+        if (! in_array($argv[1] ?? '', HIVE_HOOK_VERBS, true) || getenv('HIVE_FORWARDED') === '1'
+            || ! function_exists('proc_open') || ! function_exists('proc_get_status') || ! defined('STDIN') || PHP_BINARY === ''
+            || hive_run_context() !== 'plugin') {
+            return null;
+        }
+
+        $root = hive_plugin_candidate_root(false);
+        $real = $root === null ? false : realpath($root.'/scripts/hive.php');
+        $self = realpath(__FILE__);
+        if ($real === false || $self === false || $real === $self || ! is_file($real) || ! hive_plugin_under_own_cache($real)) {
+            return null;
+        }
+
+        $head = @file_get_contents($real, false, null, 0, 65536);
+        if (! is_string($head) || preg_match("/^const HIVE_VERSION = '([0-9][0-9A-Za-z.+-]{0,30})';\r?$/m", $head, $m) !== 1
+            || ! version_compare($m[1], HIVE_VERSION, '>')) {
+            return null;
+        }
+
+        if (hive_plugin_enabled_value() === false) {
+            return null;
+        }
+
+        $env = getenv();
+        $env['HIVE_FORWARDED'] = '1';
+        $process = @proc_open([PHP_BINARY, $real, ...array_map('strval', array_slice($argv, 1))],
+            [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes, null, $env, PHP_OS_FAMILY === 'Windows' ? ['bypass_shell' => true] : null);
+        if (! is_resource($process)) {
+            return null;
+        }
+
+        // It ran, and may have read stdin: whatever it says, the call never
+        // runs twice. Its exit as proc_get_status reads it (proc_close gives
+        // a signalled child's raw wait status, which would read as a code).
+        $status = null;
+        while (is_array($polled = @proc_get_status($process))) {
+            $status = $polled;
+            if (! $polled['running']) {
+                break;
+            }
+            usleep(2000);
+        }
+        @proc_close($process);
+
+        $exited = is_array($status) && ! $status['running'] && ! $status['signaled'];
+
+        return $exited && in_array($status['exitcode'], [0, 2], true) ? $status['exitcode'] : 0;
+    } catch (Throwable $e) {
+        return null;
+    }
 }
 
 /**
@@ -53141,8 +53303,9 @@ function hive_loader_source(): string
         | client comes from the Claude Code plugin velu-hive@velu, which Claude
         | Code keeps updated, in a folder per version under its plugin cache. The
         | status line, the allow rules and CLAUDE.local.md name this file, and it
-        | runs the copy installed_plugins.json names: only a file under the cache
-        | folder, by realpath, and none at all while the plugin is switched off,
+        | runs the copy installed_plugins.json names: only a file under the
+        | plugin's own folder of the cache (velu/velu-hive), by realpath, and
+        | none at all while the plugin is switched off,
         | by the developer or by the organisation: managed settings files,
         | claude.ai server-managed settings as Claude Code caches them, on
         | macOS the MDM profiles, and on Windows and WSL the registry policy.
@@ -53432,7 +53595,9 @@ function hive_loader_source(): string
                     }
                 }
             }
-            $hiveLoaderCache = realpath($hiveLoaderPaths['cache']);
+            // Only under the plugin's own folder of the cache: Claude Code
+            // keeps velu-hive@velu's versions in <cache>/velu/velu-hive.
+            $hiveLoaderCache = realpath($hiveLoaderPaths['cache'].'/velu/velu-hive');
             $hiveLoaderReal = $hiveLoaderCandidate !== null ? realpath($hiveLoaderCandidate.'/scripts/hive.php') : false;
             if ($hiveLoaderCache !== false && $hiveLoaderReal !== false && is_file($hiveLoaderReal)) {
                 $hiveLoaderPrefix = $hiveLoaderSlashes($hiveLoaderCache).'/';
