@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.17.0';
+const HIVE_VERSION = '1.17.1';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -614,6 +614,27 @@ const HIVE_BREAKER_STEPS = [
     5 => 900,   // 15 min
     3 => 300,   // 5 min
 ];
+
+/*
+| A slow answer is not an outage (Hive 2.2). A read timeout -- Hive took the
+| connection, then did not answer within the request's budget -- counts
+| against that request's kind alone (hive_request_kind()), never the
+| breaker: this many in a row hold that kind for HIVE_SLOW_HOLD seconds,
+| and every other kind still goes. On 12 October 2026 three slow progress
+| reads held every request to the host for five minutes, an override among
+| them, while Hive answered /up in 0.18 s.
+*/
+const HIVE_SLOW_STRIKES = 3;
+const HIVE_SLOW_HOLD = 60;
+/*
+| Late answers count in a row only this close together: a kind late once an
+| hour (a capture Hive takes longer over than its budget, every time) never
+| adds up to a hold. And a read timeout while ANOTHER kind is already late
+| within it is a failure the breaker counts as well: every route late at
+| once is the backend gone (a hung database behind a load balancer that
+| still takes the connection), an outage, never a minute's `slow`.
+*/
+const HIVE_SLOW_WINDOW = 300;
 
 /*
 | Holds that are NOT failures. The owner pausing Hive (503 `paused`) and a rate
@@ -6551,6 +6572,10 @@ function hive_claim_open_in(array $state, array $cache, string $branch): ?bool
 /**
  * One outbound request. The ONLY function in this file that touches the network.
  *
+ * Besides the keys below, a result may carry `read_timeout` (true: connected,
+ * but no answer within the budget), `held_class` (a 429's hold kept it
+ * here) or `held_kind` (Hive's slowness on its kind kept it here).
+ *
  * @param  array<string, mixed>|null  $body
  * @return array{ok: bool, status: int, json: array<string,mixed>|null, raw: string, ms: int, error: ?string, headers: array<string,string>}
  */
@@ -6669,6 +6694,16 @@ function hive_http(string $method, string $path, ?array $body, string $profile =
         return $result;
     }
 
+    // A kind Hive has been slow to answer (hive_kind_slow()): only it waits.
+    $kind = hive_request_kind($method, $path, $profile);
+    if (hive_kind_held($host, $kind) > 0) {
+        $result['error'] = 'circuit-open';
+        $result['held_kind'] = $kind;
+        hive_audit_write($method, $url, $payload, $result, false);
+
+        return $result;
+    }
+
     $result = function_exists('curl_init')
         ? hive_http_curl($method, $url, $payload, $headers, $connectMs, $readMs)
         : hive_http_socket($method, $url, $payload, $headers, $connectMs, $readMs);
@@ -6696,7 +6731,7 @@ function hive_http(string $method, string $path, ?array $body, string $profile =
     // The pause's question is judged by hive_pause_probe() alone: only a
     // policy saying `paused: false` ends the hold, whatever else comes back.
     if (! $probing) {
-        hive_http_observe($host, $result, $method, $path);
+        hive_http_observe($host, $result, $method, $path, $kind);
     }
 
     hive_audit_write($method, $url, $payload, $result, false);
@@ -6722,6 +6757,13 @@ function hive_http(string $method, string $path, ?array $body, string $profile =
  * capture, a broker write -- does not open it: it holds that class alone
  * (hive_hold_class(), hive_class_hold()).
  *
+ * Nor is a READ TIMEOUT a failure (Hive 2.2): the connection was made, so
+ * Hive is there, only slow to answer this kind of request. It counts against
+ * $kind alone (hive_kind_slow()), and the breaker is left as it was, neither
+ * failed nor closed. A connection that could not be made -- DNS, refused, a
+ * connect or TLS timeout -- is a transport error like any other. An answer
+ * that came in time, whatever it says, clears $kind's count.
+ *
  * The 1.0 client dropped every 4xx silently, forever. A developer whose token
  * expired simply became invisible to the team without ever being told.
  *
@@ -6734,9 +6776,27 @@ function hive_http(string $method, string $path, ?array $body, string $profile =
  *
  * @param  array{ok: bool, status: int, json: array<string,mixed>|null, raw: string, ms: int, error: ?string, headers: array<string,string>}  $result
  */
-function hive_http_observe(string $host, array $result, string $method = '', string $path = ''): void
+function hive_http_observe(string $host, array $result, string $method = '', string $path = '', string $kind = ''): void
 {
     $status = (int) ($result['status'] ?? 0);
+    $kind = $kind !== '' ? $kind : hive_request_kind($method, $path, '');
+
+    if (! empty($result['read_timeout'])) {
+        $others = hive_kinds_late($host, $kind);
+        hive_kind_slow($host, $kind);
+
+        // Late on another kind too: the whole backend, which the breaker
+        // counts as it always did (HIVE_SLOW_WINDOW).
+        if ($others > 0) {
+            hive_breaker_failure($host, 'read timeout on '.$kind.' with '.$others.' other '.($others === 1 ? 'kind' : 'kinds').' late');
+        }
+
+        return;
+    }
+    if ($status !== 0) {
+        hive_kind_answered($host, $kind);
+    }
+
     $json = is_array($result['json'] ?? null) ? $result['json'] : [];
     $code = hive_str($json['code'] ?? null);
     // The code is echoed into a notice, so only a machine-shaped one is kept.
@@ -7233,6 +7293,18 @@ function hive_http_curl(string $method, string $url, ?string $payload, array $he
 
     if ($raw === false) {
         $out['error'] = curl_error($handle) !== '' ? curl_error($handle) : 'transport error';
+
+        /*
+        | 28 is CURLE_OPERATION_TIMEDOUT, for a connect timeout and a read
+        | timeout alike. Only once the request was on its way -- the
+        | connection and TLS done, which the pre-transfer time says -- is it
+        | a read timeout: Hive is there, and slow. An answer cut off midway is
+        | no answer, whatever status its first line had.
+        */
+        if (curl_errno($handle) === 28 && (float) curl_getinfo($handle, CURLINFO_PRETRANSFER_TIME) > 0.0) {
+            $out['read_timeout'] = true;
+            $out['status'] = 0;
+        }
     } else {
         $out['raw'] = (string) $raw;
         // 2xx and 304 are both success: 304 is the whole point of the ETag poll.
@@ -7328,12 +7400,14 @@ function hive_http_socket(string $method, string $url, ?string $payload, array $
 
     $response = '';
     $deadline = microtime(true) + (($connectMs + $readMs) / 1000);
+    $timedOut = false;
 
     while (! feof($socket)) {
         $chunk = @fread($socket, 16384);
         if ($chunk === false || $chunk === '') {
             $meta = @stream_get_meta_data($socket);
             if (is_array($meta) && ! empty($meta['timed_out'])) {
+                $timedOut = true;
                 break;
             }
         } else {
@@ -7341,6 +7415,7 @@ function hive_http_socket(string $method, string $url, ?string $payload, array $
         }
 
         if (microtime(true) >= $deadline) {
+            $timedOut = ! feof($socket);
             break;
         }
 
@@ -7351,6 +7426,15 @@ function hive_http_socket(string $method, string $url, ?string $payload, array $
     }
 
     @fclose($socket);
+
+    // Connected, the request sent, and the answer not all in by the budget:
+    // a read timeout, as hive_http_curl() tells it (hive_kind_slow()).
+    if ($timedOut) {
+        $out['error'] = 'read timed out after '.$readMs.' ms';
+        $out['read_timeout'] = true;
+
+        return $out;
+    }
 
     $split = strpos($response, "\r\n\r\n");
     if ($split === false) {
@@ -7680,6 +7764,170 @@ function hive_runs_hold(string $host, int $seconds): void
 function hive_runs_held(string $host): int
 {
     return hive_class_held($host, 'runs');
+}
+
+/**
+ * The kind of request $method $path is, for Hive's slowness
+ * (hive_kind_slow()). Every request has one, and a kind Hive keeps
+ * answering late is held alone:
+ *
+ *   runs, workplan, broker  the classes a 429 holds (hive_hold_class())
+ *   override                the developer's own override of a ruling: a
+ *                           broker write Hive caps with the others, never
+ *                           held for another broker write's slowness
+ *   check                   `check`: POST /collisions/check, GET /activity,
+ *                           a slice's window
+ *   activity                the live state said first (`state-first`), read
+ *                           in 200 ms: its timeouts say nothing of the
+ *                           flush's own POST /snapshots
+ *   workplans               the background mirror's GET
+ *                           /progress/workplans, the slowest read
+ *   progress                every other /progress request: the progress
+ *                           verbs' reads and writes, the parks' poll
+ *   claims, sessions, ...   every other route by its first segment: a
+ *                           session's start, heartbeats and end are
+ *                           `sessions`; snapshots, policy, health, setup
+ *
+ * So a slow progress read never holds a claim, a heartbeat, a check, a
+ * session start or an override.
+ */
+function hive_request_kind(string $method, string $path, string $profile): string
+{
+    // An absolute address (doctor's GET /health) is named by its route under the API.
+    $route = (string) preg_replace('#^/api/v\d+(?=/)#', '', (string) (parse_url($path, PHP_URL_PATH) ?? ''));
+
+    $class = hive_hold_class($method, $route);
+    if ($class === 'broker' && preg_match('#^/progress/cases/[^/]+/override$#', $route) === 1) {
+        return 'override';
+    }
+    if ($class !== null) {
+        return $class;
+    }
+    if ($profile === 'check' || $route === '/collisions/check' || $route === '/activity') {
+        return 'check';
+    }
+    if ($profile === 'state-first') {
+        return 'activity';
+    }
+    // The background mirror's read of every workplan, the slowest read
+    // there is: never the kind of the agent's own progress verbs.
+    if ($method === 'GET' && $route === '/progress/workplans') {
+        return 'workplans';
+    }
+    if ($route === '/progress' || str_starts_with($route, '/progress/')) {
+        return 'progress';
+    }
+
+    return preg_match('#^/([a-z][a-z0-9-]{0,39})#', $route, $m) === 1 ? $m[1] : 'other';
+}
+
+/**
+ * Hive took a request of $kind and did not answer it within its budget (a
+ * read timeout): one more late answer in a row. From HIVE_SLOW_STRIKES on,
+ * each one holds $kind for HIVE_SLOW_HOLD seconds, so a kind still slow
+ * when its hold runs out is held again after one more try, and an answer in
+ * time ends it (hive_kind_answered()). Every other kind still goes, and the
+ * breaker is left alone: Hive is there.
+ *
+ * Kept in state.json's `slow`, by host and kind, apart from the breaker and
+ * from a 429's class holds (`<class>_hold`): a success on another route
+ * resets the breaker's entry, and the override is a broker write that a
+ * slow broker must not hold. Said by the status line (`slow`) and doctor,
+ * never as a notice: a minute's wait is not news.
+ */
+function hive_kind_slow(string $host, string $kind): void
+{
+    hive_state_mutate(static function (array $state) use ($host, $kind): array {
+        $slow = is_array($state['slow'] ?? null) ? $state['slow'] : [];
+        $kinds = is_array($slow[$host] ?? null) ? $slow[$host] : [];
+        $entry = is_array($kinds[$kind] ?? null) ? $kinds[$kind] : [];
+        // In a row only within HIVE_SLOW_WINDOW: an old late answer is forgotten.
+        $recent = time() - (int) ($entry['at'] ?? 0) <= HIVE_SLOW_WINDOW;
+        $late = ($recent ? (int) ($entry['late'] ?? 0) : 0) + 1;
+
+        $kinds[$kind] = ['late' => $late, 'at' => time()] + ($late >= HIVE_SLOW_STRIKES ? ['until' => time() + HIVE_SLOW_HOLD] : []);
+        $slow[$host] = $kinds;
+        $state['slow'] = $slow;
+
+        return $state;
+    });
+}
+
+/** How many kinds other than $kind answered late on $host within HIVE_SLOW_WINDOW. */
+function hive_kinds_late(string $host, string $kind): int
+{
+    $kinds = hive_state()['slow'][$host] ?? null;
+    if (! is_array($kinds)) {
+        return 0;
+    }
+
+    $now = time();
+    $late = 0;
+    foreach ($kinds as $other => $entry) {
+        if ($other !== $kind && is_array($entry) && (int) ($entry['late'] ?? 0) > 0 && $now - (int) ($entry['at'] ?? 0) <= HIVE_SLOW_WINDOW) {
+            $late++;
+        }
+    }
+
+    return $late;
+}
+
+/** An answer to a request of $kind came in time: its late answers in a row end, and the hold they made with them. */
+function hive_kind_answered(string $host, string $kind): void
+{
+    // The common case is a kind never late, and that must cost no lock and no write.
+    if (! is_array(hive_state()['slow'][$host][$kind] ?? null)) {
+        return;
+    }
+
+    hive_state_mutate(static function (array $state) use ($host, $kind): array {
+        $slow = is_array($state['slow'] ?? null) ? $state['slow'] : [];
+        $kinds = is_array($slow[$host] ?? null) ? $slow[$host] : [];
+        unset($kinds[$kind]);
+
+        if ($kinds === []) {
+            unset($slow[$host]);
+        } else {
+            $slow[$host] = $kinds;
+        }
+        if ($slow === []) {
+            unset($state['slow']);
+        } else {
+            $state['slow'] = $slow;
+        }
+
+        return $state;
+    });
+}
+
+/** How many seconds $kind is still held for on $host for Hive's slowness; 0 when it is not. */
+function hive_kind_held(string $host, string $kind): int
+{
+    $entry = hive_state()['slow'][$host][$kind] ?? null;
+
+    return is_array($entry) ? max(0, (int) ($entry['until'] ?? 0) - time()) : 0;
+}
+
+/**
+ * The kinds held on $host for Hive's slowness, by name, each with the
+ * seconds left: what the status line's `slow` and doctor's row say.
+ *
+ * @param  array<string, mixed>  $state
+ * @return array<string, int>
+ */
+function hive_slow_kinds(array $state, string $host): array
+{
+    $kinds = $state['slow'][$host] ?? null;
+    $held = [];
+    foreach (is_array($kinds) ? $kinds : [] as $kind => $entry) {
+        $left = is_array($entry) ? (int) ($entry['until'] ?? 0) - time() : 0;
+        if (is_string($kind) && preg_match('/^[a-z][a-z0-9-]{0,39}$/', $kind) === 1 && $left > 0) {
+            $held[$kind] = $left;
+        }
+    }
+    ksort($held);
+
+    return $held;
 }
 
 /** Is this process asking GET /policy for a paused hold right now (hive_pause_probe())? */
@@ -15565,6 +15813,10 @@ function hive_verb_statusline(): int
         $flags[] = 'paused';
     } elseif ($breaker === 'offline') {
         $flags[] = 'offline';
+    } elseif (hive_slow_kinds($state, $host) !== []) {
+        // Hive is there, and slow to answer one kind of request: that kind
+        // waits a minute, and every other still goes (hive_kind_slow()).
+        $flags[] = 'slow';
     }
 
     if ($caches === []) {
@@ -15965,6 +16217,19 @@ function hive_verb_doctor(): int
             .(hive_safe_text($entry['last_error'] ?? null, 200) !== '' ? ' ('.hive_safe_text($entry['last_error'] ?? null, 200).')' : '');
     }
     $add('circuit breaker', 'ok', $breakerRows === [] ? 'closed, no failures recorded' : implode(' | ', $breakerRows));
+
+    // A kind of request Hive was slow to answer, held alone (hive_kind_slow()).
+    $slowRows = [];
+    foreach ((array) ($state['slow'] ?? []) as $slowHost => $kinds) {
+        foreach (hive_slow_kinds($state, (string) $slowHost) as $kind => $left) {
+            $late = (int) ($kinds[$kind]['late'] ?? 0);
+            $slowRows[] = $slowHost.': '.$kind.' held for '.hive_ago($left).' after '.$late.' answer'.($late === 1 ? '' : 's')
+                .' in a row came later than their budget';
+        }
+    }
+    if ($slowRows !== []) {
+        $add('slow answers', 'WARN', implode(' | ', $slowRows).'; every other kind of request still goes');
+    }
 
     $outbox = hive_home().'/outbox.ndjson';
     $queued = is_file($outbox) ? count(@file($outbox, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []) : 0;
@@ -21528,7 +21793,7 @@ function hive_progress_blocked(): ?string
 
 /**
  * Why a request came back without Hive's answer, in words: a dry run, the
- * owner's pause, a rate limit, the breaker, or the network.
+ * owner's pause, a rate limit, Hive's slowness, the breaker, or the network.
  *
  * @param  array<string, mixed>  $result
  */
@@ -21560,6 +21825,12 @@ function hive_progress_unreached(array $result): string
         if ($left === 0 && $class !== null && hive_class_held($host, $class) > 0) {
             return 'Hive asked this machine to slow down (retry in '.hive_ago(hive_class_held($host, $class)).')';
         }
+        // Held for Hive's slowness on its kind alone (hive_kind_slow()): Hive
+        // is there, and every other kind of request still goes.
+        $kind = hive_str($result['held_kind'] ?? null);
+        if ($left === 0 && $kind !== null && hive_kind_held($host, $kind) > 0) {
+            return 'Hive is slow to answer (retry in '.hive_ago(hive_kind_held($host, $kind)).')';
+        }
         if ($left === 0 && hive_runs_held($host) > 0) {
             return 'Hive asked this machine to slow down (retry in '.hive_ago(hive_runs_held($host)).')';
         }
@@ -21571,6 +21842,9 @@ function hive_progress_unreached(array $result): string
         }
 
         return 'Hive is unreachable (retry in '.hive_ago($left).')';
+    }
+    if (! empty($result['read_timeout'])) {
+        return 'Hive did not answer in time';
     }
     if ($status >= 500) {
         return 'Hive answered HTTP '.$status;
