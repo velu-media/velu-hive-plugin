@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.17.2';
+const HIVE_VERSION = '1.17.3';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -31161,10 +31161,12 @@ function hive_next_items(array $raw): array
  * waiting only on slices (kind slice) waits for them to merge, never on a
  * file: `waits_on` names them by key. A slice the developer holds with no
  * task yet, blocked, comes with no key and its own key in `slice`, and
- * what it waits on may be an external blocker as well as a slice.
+ * what it waits on may be an external blocker as well as a slice, and
+ * `held_via` says how the developer holds it: `take` (in Hive), `board` (only
+ * through the team's PROGRESS.md) or `file` (the gap review's).
  *
  * @param  array<mixed>  $raw
- * @return list<array{repo: string, key: ?string, title: string, by: ?string, since: ?string, files: int, quiet: bool, kind: string, slice: ?string, waits_on: list<string>}>
+ * @return list<array{repo: string, key: ?string, title: string, by: ?string, since: ?string, files: int, quiet: bool, kind: string, slice: ?string, waits_on: list<string>, held_via: ?string}>
  */
 function hive_next_waiting(array $raw): array
 {
@@ -31201,6 +31203,8 @@ function hive_next_waiting(array $raw): array
             'slice' => $slice,
             'waits_on' => $on,
             'people' => $people,
+            // How a held slice is held (a server before 15 Oct 2026 sends none): only `board` is worded.
+            'held_via' => $kind === 'slice' && $key === null && in_array($entry['held_via'] ?? null, ['take', 'board', 'file'], true) ? (string) $entry['held_via'] : null,
         ];
     }
 
@@ -31661,7 +31665,10 @@ function hive_next_item_line(array $item, int $number, int $day): string
  * 3 h ago)", with "its holder went quiet". A slice the developer holds
  * with no task yet is listed by what it waits on, a slice or an external
  * blocker: "- velu-be GAP-B3 'Content admin' (you hold it, no task yet)
- * waits on GAP-A0a and decision".
+ * waits on GAP-A0a and decision". One held only through the team's
+ * PROGRESS.md (`held_via: board`) is held there, never missing a task: "-
+ * velu-be TGB-T4 'Search' (you hold it in the team's PROGRESS.md) waits on
+ * TGB-T2"; a server before the field says "no task yet" as ever.
  *
  * @param  array<string, mixed>  $task
  */
@@ -31676,7 +31683,9 @@ function hive_next_waiting_line(array $task, int $now): string
     if ($slices && $task['key'] === null) {
         $key = (string) $task['slice'];
 
-        return '- '.$task['repo'].' '.$key.($title !== '' && $title !== $key ? ' \''.$title.'\'' : '').' (you hold it, no task yet) waits on '
+        $held = ($task['held_via'] ?? null) === 'board' ? 'you hold it in the team\'s PROGRESS.md' : 'you hold it, no task yet';
+
+        return '- '.$task['repo'].' '.$key.($title !== '' && $title !== $key ? ' \''.$title.'\'' : '').' ('.$held.') waits on '
             .($on !== [] ? hive_slice_list($on) : 'others');
     }
 
