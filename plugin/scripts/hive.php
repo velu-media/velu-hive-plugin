@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.17.3';
+const HIVE_VERSION = '1.17.4';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -635,6 +635,28 @@ const HIVE_SLOW_HOLD = 60;
 | still takes the connection), an outage, never a minute's `slow`.
 */
 const HIVE_SLOW_WINDOW = 300;
+
+/*
+| The holds this machine times for itself -- a kind Hive was slow to answer
+| (HIVE_SLOW_HOLD) and the breaker's steps (HIVE_BREAKER_STEPS) -- last from
+| 1 - HIVE_HOLD_JITTER to 1 + HIVE_HOLD_JITTER times their length, by a
+| factor fixed for the machine and its Hive home (hive_hold_seconds()). The
+| whole team meets a slow minute at once: with holds of one length every
+| machine came back in the same second, into the minute that had just been
+| slow (Z2, 15 October 2026). A machine's holds are the same every time;
+| the team's are spread over the whole range. A Retry-After (the owner's
+| pause, a 429) is Hive's own number and is kept as given.
+*/
+const HIVE_HOLD_JITTER = 0.5;
+
+/*
+| Right after a slow spell -- the spool took a write within HIVE_SLOW_WINDOW --
+| a replay sends at most this many spooled writes (hive_outbox_drain()):
+| every machine met the same slow minute, and a burst of ten from each, the
+| moment Hive answers again, is the next slow minute. An older spool is one
+| laptop's own time away, and replays as before.
+*/
+const HIVE_OUTBOX_REPLAY_AFTER_SLOW = 3;
 
 /*
 | Holds that are NOT failures. The owner pausing Hive (503 `paused`) and a rate
@@ -7539,8 +7561,36 @@ function hive_mask_token(string $token): string
 // -----------------------------------------------------------------------------
 
 /**
+ * This machine's share of a hold it times for itself (HIVE_HOLD_JITTER):
+ * $seconds stretched by hive_hold_factor() of the machine's name and its
+ * Hive home, so two developers on machines of the same name still differ.
+ * At least a second; $seconds itself if anything about it fails.
+ */
+function hive_hold_seconds(int $seconds): int
+{
+    try {
+        return max(1, (int) round($seconds * hive_hold_factor(hive_machine().'|'.hive_home())));
+    } catch (Throwable $e) {
+        return max(1, $seconds);
+    }
+}
+
+/**
+ * The factor a seed's holds are stretched by, from 1 - HIVE_HOLD_JITTER to
+ * 1 + HIVE_HOLD_JITTER, spread evenly over seeds: the first 32 bits of the
+ * seed's SHA-256. The same seed, the same factor, every time.
+ */
+function hive_hold_factor(string $seed): float
+{
+    $bits = (float) hexdec(substr(hash('sha256', $seed), 0, 8));
+
+    return 1 - HIVE_HOLD_JITTER + 2 * HIVE_HOLD_JITTER * ($bits / 4294967295);
+}
+
+/**
  * Per-host suppression: 3 consecutive failures -> 5 min, 5 -> 15 min,
- * 8+ -> 30 min (the cap). Any success resets everything.
+ * 8+ -> 30 min (the cap), each this machine's share of it, from half to
+ * one and a half times (hive_hold_seconds()). Any success resets everything.
  *
  * The point is not to protect the server, it is to protect the developer's
  * latency. Once Hive is known to be down, every subsequent hook that would have
@@ -7580,7 +7630,9 @@ function hive_breaker_failure(string $host, string $error): void
         unset($entry['hold_reason']);
 
         if ($suppress > 0) {
-            $entry['open_until'] = time() + $suppress;
+            // This machine's share of the step, so the team's breakers do not
+            // all close in the same second (HIVE_HOLD_JITTER).
+            $entry['open_until'] = time() + hive_hold_seconds($suppress);
 
             /*
             | Told EXACTLY TWICE: once here, once on recovery. Nothing in
@@ -7861,7 +7913,7 @@ function hive_kind_slow(string $host, string $kind): void
         $recent = time() - (int) ($entry['at'] ?? 0) <= HIVE_SLOW_WINDOW;
         $late = ($recent ? (int) ($entry['late'] ?? 0) : 0) + 1;
 
-        $kinds[$kind] = ['late' => $late, 'at' => time()] + ($late >= HIVE_SLOW_STRIKES ? ['until' => time() + HIVE_SLOW_HOLD] : []);
+        $kinds[$kind] = ['late' => $late, 'at' => time()] + ($late >= HIVE_SLOW_STRIKES ? ['until' => time() + hive_hold_seconds(HIVE_SLOW_HOLD)] : []);
         $slow[$host] = $kinds;
         $state['slow'] = $slow;
 
@@ -8346,7 +8398,9 @@ function hive_outbox_trim(): void
  * lunch.
  *
  * A single flush drains at most $max, so a week-old spool does not turn one
- * flush into a 500-request storm.
+ * flush into a 500-request storm; and at most HIVE_OUTBOX_REPLAY_AFTER_SLOW
+ * when the spool took a write within HIVE_SLOW_WINDOW, right after a slow
+ * spell that every machine of the team met at once.
  *
  * The replay runs unlocked -- it is network time, and a lock held across it
  * would stall every hook spooling meanwhile -- and what it consumed is then
@@ -8366,6 +8420,17 @@ function hive_outbox_drain(int $max = 25): int
     $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if (! is_array($lines) || $lines === []) {
         return 0;
+    }
+
+    // A write spooled moments ago: a slow spell or an outage just ended, for
+    // every machine of the team at once.
+    $newest = 0;
+    foreach ($lines as $line) {
+        $record = json_decode($line, true);
+        $newest = is_array($record) ? max($newest, (int) ($record['at'] ?? 0)) : $newest;
+    }
+    if (time() - $newest <= HIVE_SLOW_WINDOW) {
+        $max = min($max, HIVE_OUTBOX_REPLAY_AFTER_SLOW);
     }
 
     $sent = 0;
@@ -11538,10 +11603,22 @@ function hive_verb_flush(array $args): int
     // below (hive_wake_ledger()).
     hive_wake_ledger($session);
 
+    /*
+    | Stop cannot wake the agent (its turn is over), so nothing it finds is
+    | marked announced: the next PostToolBatch delivers it instead. Marking it
+    | here would have the agent never told. Nor can a sub-agent's flush (its
+    | input carries agent_id, hive_prompt_in_subagent()): a collision is the
+    | main agent's to hear, the one the developer talks to, and one marked
+    | announced inside a sub-agent was never said to it (B9). The sub-agent's
+    | flush publishes all the same; the main agent's next flush says it.
+    */
+    $announce = ! $final && ! hive_prompt_in_subagent($input);
+
     // A hard collision that a publish unable to wake the agent found -- the
-    // detached one at session start, a Stop -- is still unannounced in its
-    // repository's cache, and this flush delivers it even with nothing due.
-    $deferred = ! $final && hive_deferred_hard($session, $roots, false) !== [];
+    // detached one at session start, a Stop, a sub-agent's flush -- is still
+    // unannounced in its repository's cache, and this flush delivers it even
+    // with nothing due.
+    $deferred = $announce && hive_deferred_hard($session, $roots, false) !== [];
 
     if ($due === [] && $refresh === [] && ! $deferred) {
         return hive_activity_flush_exit(hive_flush_tail($progressEvent, $progressBase, $sessionId, $session, $input, true), $headlessStop);
@@ -11560,13 +11637,6 @@ function hive_verb_flush(array $args): int
     $newHard = [];
     $reached = false;
     $started = microtime(true);
-
-    /*
-    | Stop cannot wake the agent (its turn is over), so nothing it finds is
-    | marked announced: the next PostToolBatch delivers it instead. Marking it
-    | here would have the agent never told.
-    */
-    $announce = ! $final;
 
     try {
         // What the previous holder of the lock left, not what we read before it.
@@ -11624,6 +11694,13 @@ function hive_verb_flush(array $args): int
     // this publish superseded is gone already (hive_outbox_forget_claim()).
     if ($reached && ! $headlessStop) {
         hive_outbox_drain(10);
+    }
+
+    // Found by a flush that may not say it -- a Stop's, a sub-agent's -- and
+    // left unstamped in the caches (hive_merge_snapshot() still returns the
+    // lines): the main agent's next flush says it (hive_deferred_hard()).
+    if (! $announce) {
+        $newHard = [];
     }
 
     // enforce=off or the owner's pause: the wake-up is as silent as the gate
@@ -11708,6 +11785,15 @@ function hive_quiet_hard_note(string $sessionId, array $session): ?string
  * quiet claim's HIVE NOTE, only when nothing else spoke -- and the work
  * plan only after that. Returns the exit: 2 when HIVE RESUME was written.
  *
+ * Inside a sub-agent (its input carries agent_id, hive_prompt_in_subagent())
+ * nothing here speaks, and so nothing is marked said: every item below is
+ * marked for the whole session as it is said, and said into a sub-agent it
+ * never reached the main agent, the one the developer talks to -- for half
+ * an hour, or for good when it is said once (B9). The main agent's next
+ * flush says it. Everything that is not a word to the agent still runs:
+ * the parks' poll, the push requests, the work plan's push and the
+ * progress report's.
+ *
  * @param  array<string, mixed>  $session
  * @param  array<string, string>  $input
  */
@@ -11715,6 +11801,10 @@ function hive_flush_tail(string $event, ?string $base, string $sessionId, array 
 {
     $started = microtime(true);
     $exit = 0;
+    $subagent = hive_prompt_in_subagent($input);
+    if ($subagent) {
+        $speak = false;
+    }
     if ($event === 'flush') {
         // After a Bash call, whether a plan this session captured reached its
         // upstream (client 1.11.0, SECTION 30: client lane C1's check).
@@ -11750,7 +11840,7 @@ function hive_flush_tail(string $event, ?string $base, string $sessionId, array 
         } else {
             // A quiet claim's HIVE NOTE waits while a broker item that goes
             // before it is left to say.
-            $said = hive_waits_flush($sessionId, $session, $speak && ($item === null || $item['tier'] >= 4));
+            $said = hive_waits_flush($sessionId, $session, $speak && ($item === null || $item['tier'] >= 4), ! $subagent);
             if ($said['stderr'] !== null) {
                 fwrite(STDERR, $said['stderr']."\n");
                 $exit = 2;
@@ -29206,10 +29296,13 @@ function hive_waits_tree(?string $base): array
  *   note   otherwise, when the flush may speak ($speak): once, that a
  *          teammate's claim went quiet (additionalContext), never a wake
  *
+ * Without $wake (a sub-agent's flush, hive_flush_tail()) it polls and
+ * nothing more: no wake, no note, and no task marked woken.
+ *
  * @param  array<string, mixed>  $session
  * @return array{stderr: ?string, context: ?string}
  */
-function hive_waits_flush(string $sessionId, array $session, bool $speak): array
+function hive_waits_flush(string $sessionId, array $session, bool $speak, bool $wake = true): array
 {
     $none = ['stderr' => null, 'context' => null];
     if (! is_file(hive_waits_file('waits.json')) || hive_token() === null) {
@@ -29234,7 +29327,7 @@ function hive_waits_flush(string $sessionId, array $session, bool $speak): array
         $local = hive_waits_local();
     }
 
-    if ($mode !== 'wake' || hive_is_headless() || hive_env('HIVE_REWAKE', '1') !== '1') {
+    if (! $wake || $mode !== 'wake' || hive_is_headless() || hive_env('HIVE_REWAKE', '1') !== '1') {
         return $none;
     }
 
@@ -51371,6 +51464,9 @@ function hive_prompt_text_problem(string $words, int $max, bool $forAgent): ?str
  * it to, never a sub-agent it started, which may run in another worktree or
  * another mode (the design's Ruling 11): there it is not taken, said, or
  * marked said or seen, and the main session meets it at its own next hook.
+ * So is everything else a flush says (B9): Hive's rulings and requests,
+ * HIVE RESUME, the collision wake-up and the notes (hive_verb_flush(),
+ * hive_flush_tail()).
  *
  * @param  array<string, mixed>  $input  the hook's own input
  */
