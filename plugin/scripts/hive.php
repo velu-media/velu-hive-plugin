@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.18.0';
+const HIVE_VERSION = '1.19.0';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -2724,6 +2724,7 @@ function hive_scan_json_string(string $raw, string $key): ?string
 //   <home>/cache/<hash>.json     per repository snapshot, the gate's only input
 //   <home>/outbox.ndjson         failed writes, replayed later
 //   <home>/audit.ndjson          every outbound request, for `audit`
+//   <home>/prompts.json          collision prompts and what followed (SECTION 12b)
 //   <home>/off                   kill switch
 //
 // Per-session files matter: a developer runs several Claude Code sessions at
@@ -10426,7 +10427,22 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
             ],
         ]);
     }
+    // A prompt this edit puts, remembered for what follows it (SECTION 12b).
+    $digest = hive_str($session['session_digest'] ?? null) ?? hive_client_session((string) $sessionId);
+    $claimId = hive_str($hit['id'] ?? null);
+    $remember = static function (string $surface) use ($repo, $hash, $claimId, $digest): void {
+        hive_prompt_note($surface, $repo, $hash, $claimId, $digest, HIVE_PROMPTS_GATE_WAIT);
+    };
+    // A warning is a prompt only where a person sees it, about a file that
+    // is not quiet for them or a pairing partner's, and not raised with
+    // them already: a reminder at every edit is not a new question.
+    $warned = $interactive && $found['verdict'] !== 'quiet' && empty($found['pairing']) && ! $alreadyAsked && ! $raised;
+
     if ($broker !== null && $broker['decision'] === 'warn') {
+        if ($warned) {
+            $remember('warn');
+        }
+
         return $finish(['systemMessage' => 'HIVE '.$dash.' '.$detail.' ['.$broker['reason'].']']);
     }
     $ruled = $broker !== null ? $broker['reason'] : null;
@@ -10494,6 +10510,9 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
         if (! hive_enforce_prompts($enforce)) {
             $reason[] = 'policy '.$enforce;
         }
+        if ($warned) {
+            $remember('warn');
+        }
 
         return $finish([
             'systemMessage' => 'HIVE '.$dash.' '.$detail
@@ -10550,6 +10569,7 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
     // Never "allow": that would switch off Claude Code's own permission
     // check for this write.
     if ($recommend !== 'coordinate' && hive_policy_decide($cache) === 'auto') {
+        $remember($recommend === 'proceed' ? 'auto_proceed' : 'auto_park');
         if ($recommend === 'proceed') {
             return $finish([
                 'systemMessage' => 'HIVE '.$dash.' '.$detail.($ruled !== null ? ' ['.$ruled.']' : '').' ['.HIVE_DECIDED.HIVE_RECOMMEND_LABELS['proceed'].']',
@@ -10571,6 +10591,7 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
     $context = $park === [] ? [] : ['additionalContext' => 'Hive: '.hive_claim_who($hit, 'another developer').' has '
         .hive_safe_text($label.$relative, HIVE_SAFE_PATH_MAX * 2).' open'.($found['verdict'] === 'hard' ? ' (hard)' : '')
         .'. If the developer declines this edit, run '.hive_self_command().' progress park '.$park[0].' --asked and follow its HIVE NEXT.'];
+    $remember('ask');
 
     return $finish([
         'hookSpecificOutput' => [
@@ -11180,6 +11201,16 @@ function hive_verb_mark_dirty(): int
         hive_mark($session, $match[0], $match[1], hive_path_hash($path), $now, hive_relativize($match[0], $path));
         $told = hive_mark_contested($session, $match[0], $match[1], $path, $now);
 
+        // The edit a collision prompt asked about ran: proceeded (SECTION
+        // 12b). With no prompt remembered, one is_file() and nothing more.
+        if (is_file(hive_prompts_path())) {
+            $edited = hive_relativize($match[0], $path);
+            if ($edited !== null && $edited !== '') {
+                hive_prompts_answer('proceeded', hive_broker_repo_name($match[1]), hive_path_hash($edited),
+                    hive_str($session['session_digest'] ?? null) ?? hive_client_session((string) $sessionId));
+            }
+        }
+
         // A file an edit tool wrote may be a plan (1.11.0, privacy rule
         // 3a): noted last, below, since noting it may start the capture.
         if ((HIVE_ACTIVITY_TOOL_KINDS[$input['tool_name'] ?? ''] ?? null) === 'edit') {
@@ -11458,6 +11489,376 @@ function hive_touched(array $session): array
     }
 
     return $touched;
+}
+
+// =============================================================================
+// SECTION 12b -- what followed each collision prompt (batch 5, roadmap #15)
+// =============================================================================
+//
+// Nothing recorded whether a developer went ahead after Hive warned or asked:
+// no hook is told a "No". So the client remembers each prompt it puts, in
+// <home>/prompts.json (0600, under its own lock), by hashes and ids only --
+// the repository's name, the file's path hash, the teammate's claim, the
+// session's digest -- never a path, a name or a word anyone wrote:
+//
+//   ask           the edit prompt's question (permissionDecision "ask")
+//   auto_proceed  the developer's auto-accept took Proceed anyway: at the
+//                 gate (a warning, the edit goes on) or at a check
+//   auto_park     it took any answer that leaves the file: a park, Coordinate
+//                 first or Hive's ruling, at the gate (a refusal) or a check
+//   warn          the gate's warning, in a session a person watches, about a
+//                 file that is not quiet for them, not raised with them
+//                 already (a question or a wake-up), and not a pairing
+//                 partner's
+//   plan          check's pop-up
+//   proceed       `check --proceed`: the developer's own Proceed anyway
+//   wake          a HIVE COLLISION wake-up, only when it was said, in a
+//                 session someone watches, about a scope that is one file
+//
+// What followed answers it, once: a `mark-dirty` of that file in that
+// session within HIVE_PROMPT_PROCEED_WITHIN (HIVE_PROMPT_WAKE_WITHIN for a
+// wake) is proceeded -- PostToolUse runs only for a tool the developer let
+// run -- `progress park <repository> --asked` in that session is parked,
+// and a prompt still unanswered when its window is past is declined. One
+// record per surface, repository, file and claim in HIVE_PROMPT_SEEN_FOR,
+// so a warning said at every edit is remembered once. At most
+// HIVE_PROMPTS_MAX are kept, none past HIVE_PROMPTS_KEEP. `mark-dirty`
+// with no prompts.json costs one is_file().
+//
+// Each session heartbeat carries up to HIVE_PROMPTS_REPORT_MAX answered
+// records as `prompts`, beside `gate` (hive_prompts_report()): what a 2xx
+// took is gone, what a failed heartbeat took goes back, and `seen` is never
+// sent or cleared, so a prompt sent is still not remembered twice.
+
+const HIVE_PROMPT_SURFACES = ['ask', 'auto_proceed', 'auto_park', 'warn', 'plan', 'proceed', 'wake'];
+const HIVE_PROMPT_ANSWERS = ['proceeded', 'parked', 'declined'];
+const HIVE_PROMPT_PROCEED_WITHIN = 900;
+const HIVE_PROMPT_WAKE_WITHIN = 3600;
+const HIVE_PROMPT_SEEN_FOR = HIVE_PLAN_TTL;
+const HIVE_PROMPTS_MAX = 50;
+const HIVE_PROMPTS_SEEN_MAX = 200;
+const HIVE_PROMPTS_KEEP = 86_400;
+// The lock's wait in the edit gate, whose budget is milliseconds; a prompt
+// not remembered in time is not remembered, and the edit goes on.
+const HIVE_PROMPTS_GATE_WAIT = 0.02;
+const HIVE_PROMPTS_WAIT = 0.2;
+// The most answered prompts one heartbeat carries (docs/api/sessions.md).
+const HIVE_PROMPTS_REPORT_MAX = 10;
+// The reasons whose scope is not one file: no edit answers a wake about it.
+const HIVE_PROMPT_SCOPE_NOT_FILE = ['same_directory', 'same_module', 'same_tag', 'migration_same_table', 'duplicate_migration_timestamp',
+    'truncated_claim_folder'];
+
+/** <home>/prompts.json. */
+function hive_prompts_path(): string
+{
+    return hive_home().'/prompts.json';
+}
+
+/** How long after a prompt an edit of its file still answers it. */
+function hive_prompt_window(string $surface): int
+{
+    return $surface === 'wake' ? HIVE_PROMPT_WAKE_WITHIN : HIVE_PROMPT_PROCEED_WITHIN;
+}
+
+/**
+ * prompts.json held to its shape at $now: each record whole or left out,
+ * none older than HIVE_PROMPTS_KEEP, the newest HIVE_PROMPTS_MAX, and one
+ * still unanswered past its window declined, at the window's end. `seen`
+ * keeps when each surface, repository, file and claim was last remembered,
+ * for HIVE_PROMPT_SEEN_FOR. Pure.
+ *
+ * @param  array<string, mixed>  $raw
+ * @return array{prompts: list<array{id: string, surface: string, repo: string, path_hash: string, claim: string|null, session: string|null, at: int, answer: string|null, answered_at: int|null}>, seen: array<string, int>}
+ */
+function hive_prompts_shape(array $raw, int $now): array
+{
+    $prompts = [];
+    foreach (is_array($raw['prompts'] ?? null) ? $raw['prompts'] : [] as $prompt) {
+        if (! is_array($prompt)) {
+            continue;
+        }
+        $id = hive_str($prompt['id'] ?? null);
+        $surface = hive_str($prompt['surface'] ?? null);
+        $repo = hive_str($prompt['repo'] ?? null);
+        $hash = hive_str($prompt['path_hash'] ?? null);
+        $claim = $prompt['claim'] ?? null;
+        $session = $prompt['session'] ?? null;
+        $at = $prompt['at'] ?? null;
+        $answer = $prompt['answer'] ?? null;
+        $answeredAt = $prompt['answered_at'] ?? null;
+        if ($id === null || ! hive_is_hash($id) || ! in_array($surface, HIVE_PROMPT_SURFACES, true)
+            || $repo === null || ! hive_is_repo_name($repo) || $hash === null || ! hive_is_hash($hash)
+            || ($claim !== null && (! is_string($claim) || ! hive_is_ulid($claim)))
+            || ($session !== null && (! is_string($session) || ! hive_is_hash($session)))
+            || ! is_int($at) || $at < $now - HIVE_PROMPTS_KEEP || $at > $now + 60
+            || ($answer !== null && ! in_array($answer, HIVE_PROMPT_ANSWERS, true))
+            || ($answer !== null && ! is_int($answeredAt))) {
+            continue;
+        }
+        if ($answer === null && $now - $at > hive_prompt_window($surface)) {
+            $answer = 'declined';
+            $answeredAt = $at + hive_prompt_window($surface);
+        }
+        $prompts[] = [
+            'id' => $id, 'surface' => $surface, 'repo' => $repo, 'path_hash' => $hash, 'claim' => $claim, 'session' => $session,
+            'at' => $at, 'answer' => $answer, 'answered_at' => $answer === null ? null : $answeredAt,
+        ];
+    }
+
+    $seen = [];
+    foreach (is_array($raw['seen'] ?? null) ? $raw['seen'] : [] as $key => $at) {
+        if (is_string($key) && hive_is_hash($key) && is_int($at) && $now - $at <= HIVE_PROMPT_SEEN_FOR) {
+            $seen[$key] = $at;
+        }
+    }
+
+    return [
+        'prompts' => array_slice($prompts, -HIVE_PROMPTS_MAX),
+        'seen' => array_slice($seen, -HIVE_PROMPTS_SEEN_MAX, null, true),
+    ];
+}
+
+/**
+ * Read prompts.json, let $change alter it (held to its shape before and
+ * after), and write it back, under its own lock, waited for at most $wait
+ * seconds. Nothing left in it, and the file goes. Fail-open: no lock in
+ * time, or no home, and nothing is written.
+ *
+ * @param  callable(array{prompts: list<array<string, mixed>>, seen: array<string, int>}, int): array<string, mixed>  $change
+ */
+function hive_prompts_mutate(callable $change, float $wait): void
+{
+    if (! hive_ensure_home()) {
+        return;
+    }
+
+    $handle = @fopen(hive_home().'/prompts.lock', 'c');
+    if (! is_resource($handle)) {
+        return;
+    }
+
+    $deadline = microtime(true) + $wait;
+    $locked = false;
+    do {
+        if (@flock($handle, LOCK_EX | LOCK_NB)) {
+            $locked = true;
+            break;
+        }
+        usleep(2_000);
+    } while (microtime(true) < $deadline);
+
+    if (! $locked) {
+        @fclose($handle);
+
+        return;
+    }
+
+    try {
+        $now = time();
+        $path = hive_prompts_path();
+        $raw = hive_read_json($path) ?? [];
+        $after = hive_prompts_shape($change(hive_prompts_shape($raw, $now), $now), $now);
+        if ($after['prompts'] === [] && $after['seen'] === []) {
+            if (is_file($path)) {
+                @unlink($path);
+            }
+        } elseif ($after !== $raw) {
+            hive_write_json($path, $after);
+        }
+    } finally {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+    }
+}
+
+/**
+ * Remember one prompt put about $slug's file $hash (its path hash) and the
+ * teammate's $claim, in $session (a digest): hive_prompts_note_all().
+ */
+function hive_prompt_note(string $surface, string $slug, string $hash, ?string $claim, ?string $session, float $wait = HIVE_PROMPTS_WAIT): void
+{
+    hive_prompts_note_all([[$surface, $slug, $hash, $claim, $session]], $wait);
+}
+
+/**
+ * Remember each of $notes -- [surface, slug, path hash, claim, session
+ * digest] -- in one locked write, unless the same surface was remembered
+ * for that repository, file and claim within HIVE_PROMPT_SEEN_FOR. Anything
+ * that is not a hash or an id is never written: that prompt is not
+ * remembered. Nothing to remember, and prompts.json is not touched. Never
+ * throws.
+ *
+ * @param  list<array{0: string, 1: string, 2: string, 3: string|null, 4: string|null}>  $notes
+ */
+function hive_prompts_note_all(array $notes, float $wait = HIVE_PROMPTS_WAIT): void
+{
+    $valid = [];
+    foreach ($notes as [$surface, $slug, $hash, $claim, $session]) {
+        $repo = strtolower(hive_broker_repo_name($slug));
+        $hash = strtolower($hash);
+        if (in_array($surface, HIVE_PROMPT_SURFACES, true) && hive_is_repo_name($repo) && hive_is_hash($hash)
+            && ($claim === null || hive_is_ulid($claim)) && ($session === null || hive_is_hash($session))) {
+            $valid[] = [$surface, $repo, $hash, $claim, $session];
+        }
+    }
+    if ($valid === []) {
+        return;
+    }
+
+    try {
+        hive_prompts_mutate(static function (array $doc, int $now) use ($valid): array {
+            foreach ($valid as [$surface, $repo, $hash, $claim, $session]) {
+                $key = md5($surface.'|'.$repo.'|'.$hash.'|'.($claim ?? ''));
+                if (isset($doc['seen'][$key])) {
+                    continue;
+                }
+                $doc['seen'][$key] = $now;
+                $doc['prompts'][] = [
+                    'id' => bin2hex(random_bytes(16)), 'surface' => $surface, 'repo' => $repo, 'path_hash' => $hash, 'claim' => $claim,
+                    'session' => $session, 'at' => $now, 'answer' => null, 'answered_at' => null,
+                ];
+            }
+
+            return $doc;
+        }, $wait);
+    } catch (Throwable $e) {
+        // Not remembered: the prompts themselves stand.
+    }
+}
+
+/**
+ * Answer the prompts still open in $repo (its name) of $session -- or of
+ * any session, when either side has none -- whose window is not past:
+ * $answer, now. With $hash, only the prompts about that file. Read only
+ * when prompts.json exists. Never throws.
+ */
+function hive_prompts_answer(string $answer, string $repo, ?string $hash, ?string $session): void
+{
+    $repo = strtolower($repo);
+    if (! in_array($answer, HIVE_PROMPT_ANSWERS, true) || ! hive_is_repo_name($repo) || ! is_file(hive_prompts_path())) {
+        return;
+    }
+
+    try {
+        hive_prompts_mutate(static function (array $doc, int $now) use ($answer, $repo, $hash, $session): array {
+            foreach ($doc['prompts'] as $i => $prompt) {
+                if ($prompt['answer'] !== null || $prompt['repo'] !== $repo || ($hash !== null && $prompt['path_hash'] !== $hash)
+                    || ($session !== null && $prompt['session'] !== null && $prompt['session'] !== $session)
+                    || $now < $prompt['at'] || $now - $prompt['at'] > hive_prompt_window($prompt['surface'])) {
+                    continue;
+                }
+                $doc['prompts'][$i]['answer'] = $answer;
+                $doc['prompts'][$i]['answered_at'] = $now;
+            }
+
+            return $doc;
+        }, HIVE_PROMPTS_WAIT);
+    } catch (Throwable $e) {
+        // Unanswered here, and declined once its window is past.
+    }
+}
+
+/**
+ * What the next heartbeat sends as `prompts` (docs/api/sessions.md, batch 5
+ * Task 19), taken out of prompts.json under its lock: at most
+ * HIVE_PROMPTS_REPORT_MAX ANSWERED records, the oldest first, exactly as
+ * kept -- whole-second Unix times, the session's digest Hive reads and
+ * never keeps. A prompt still unanswered stays until it is answered, and
+ * `seen` stays whole, so a warning sent is still not remembered twice.
+ * Null with none to send, or with no prompts.json (one is_file()). The
+ * caller puts them back with hive_prompts_restore() when its request did
+ * not reach Hive. Never throws.
+ *
+ * @return list<array<string, mixed>>|null
+ */
+function hive_prompts_report(): ?array
+{
+    if (! is_file(hive_prompts_path())) {
+        return null;
+    }
+
+    $taken = [];
+    try {
+        hive_prompts_mutate(static function (array $doc) use (&$taken): array {
+            $kept = [];
+            foreach ($doc['prompts'] as $prompt) {
+                if ($prompt['answer'] !== null && count($taken) < HIVE_PROMPTS_REPORT_MAX) {
+                    $taken[] = $prompt;
+                } else {
+                    $kept[] = $prompt;
+                }
+            }
+            $doc['prompts'] = $kept;
+
+            return $doc;
+        }, HIVE_PROMPTS_WAIT);
+    } catch (Throwable $e) {
+        return null;
+    }
+
+    return $taken === [] ? null : $taken;
+}
+
+/**
+ * Puts back the answered prompts a heartbeat that did not reach Hive took
+ * (hive_prompts_report()), ahead of the rest, so the next one carries them;
+ * one already back (by its id) is not doubled. Never throws.
+ *
+ * @param  list<array<string, mixed>>  $taken
+ */
+function hive_prompts_restore(array $taken): void
+{
+    try {
+        hive_prompts_mutate(static function (array $doc) use ($taken): array {
+            $ids = array_flip(array_column($doc['prompts'], 'id'));
+            $back = [];
+            foreach ($taken as $prompt) {
+                if (is_array($prompt) && is_string($prompt['id'] ?? null) && ! isset($ids[$prompt['id']])) {
+                    $back[] = $prompt;
+                }
+            }
+            $doc['prompts'] = array_merge($back, $doc['prompts']);
+
+            return $doc;
+        }, HIVE_PROMPTS_WAIT);
+    } catch (Throwable $e) {
+        // Lost with this heartbeat: Hive's measure reads them as unknown.
+    }
+}
+
+/**
+ * Whether a conflict's scope names one file, as an edit's mark-dirty names
+ * it: never a folder (`app/billing/`), a module, a tag or a table label
+ * (`database/migrations: invoices`), whose hash no edit can match. Pure.
+ *
+ * @param  array<string, mixed>  $conflict
+ */
+function hive_scope_names_file(array $conflict): bool
+{
+    $scope = hive_str($conflict['scope'] ?? null) ?? '';
+
+    return $scope !== '' && ! str_ends_with($scope, '/') && ! str_contains($scope, ': ')
+        && ! in_array($conflict['reason'] ?? null, HIVE_PROMPT_SCOPE_NOT_FILE, true);
+}
+
+/**
+ * The facts of each wake-up line hive_unannounced_hard() made in this
+ * process, by the line: its repository's slug, the scope's path hash and
+ * the teammate's claim. A flush remembers the lines it said
+ * (hive_flush_rewake()) as `wake` prompts with them.
+ *
+ * @param  array{slug: string, hash: string, claim: string|null}|null  $fact
+ * @return array<string, array{slug: string, hash: string, claim: string|null}>
+ */
+function hive_wake_facts(?string $line = null, ?array $fact = null): array
+{
+    static $facts = [];
+
+    if ($line !== null && $fact !== null && count($facts) < 100) {
+        $facts[$line] = $fact;
+    }
+
+    return $facts;
 }
 
 // =============================================================================
@@ -11753,6 +12154,18 @@ function hive_verb_flush(array $args): int
     $headless = hive_is_headless();
     $next = $newHard !== [] && ! $final && ! $headless ? hive_park_collision_next(hive_hard_repos(), $session) : null;
     $exit = hive_flush_rewake($newHard, $final, $headless, $next);
+    // Each wake-up line said to a session someone watches, remembered as a
+    // prompt (SECTION 12b): in a headless run nobody is there to answer it.
+    if (! $final && ! $headless && $newHard !== [] && hive_env('HIVE_REWAKE', '1') === '1') {
+        $facts = hive_wake_facts();
+        foreach (array_slice($newHard, 0, 3) as $said) {
+            $fact = $facts[$said] ?? null;
+            if ($fact !== null) {
+                hive_prompt_note('wake', $fact['slug'], $fact['hash'], $fact['claim'],
+                    hive_str($session['session_digest'] ?? null) ?? hive_client_session((string) $sessionId));
+            }
+        }
+    }
     // The work plan may speak only when the wake-up wrote nothing.
     $tail = hive_flush_tail($progressEvent, $progressBase, $sessionId, $session, $input,
         $newHard === [] || $final || hive_env('HIVE_REWAKE', '1') !== '1');
@@ -14065,6 +14478,19 @@ function hive_session_heartbeat(array &$session, string $repo, ?string $branch, 
         $body['gate'] = $gate;
     }
 
+    // Batch 5: what followed each collision prompt, answered (SECTION
+    // 12b), beside the gate's counts and put back the same way. A Hive that
+    // does not read `prompts` answers as before; the heartbeat never waits
+    // on them.
+    try {
+        $prompts = hive_prompts_report();
+    } catch (Throwable $e) {
+        $prompts = null;
+    }
+    if ($prompts !== null) {
+        $body['prompts'] = $prompts;
+    }
+
     // And what the session's agent has been doing (section 2.8c), whatever
     // its age. Handed back when this does not reach Hive: the flush's last
     // act sends it on its own or puts it back.
@@ -14084,6 +14510,9 @@ function hive_session_heartbeat(array &$session, string $repo, ?string $branch, 
     }
     if (! $response['ok'] && $activity !== null) {
         hive_activity_outgoing($activity);
+    }
+    if (! $response['ok'] && $prompts !== null) {
+        hive_prompts_restore($prompts);
     }
 
     // 404: not ours any more -- ended, lost after a long silence, or replaced
@@ -14465,6 +14894,12 @@ function hive_unannounced_hard(array &$cache, string $label, bool $stamp, bool $
             if ($stamp) {
                 hive_wake_ledger(null, [$mark => $since ?? '']);
             }
+        }
+
+        // What a flush that says this line remembers of it (SECTION 12b):
+        // only of a scope that names a file, which an edit can answer.
+        if ($slug !== null && ! $atStart && hive_scope_names_file($conflict)) {
+            hive_wake_facts($line, ['slug' => $slug, 'hash' => hive_path_hash($scope), 'claim' => hive_str($conflict['id'] ?? null)]);
         }
 
         $new[] = $line;
@@ -17925,13 +18360,14 @@ function hive_purge_home(string $home, bool $whole): array
 /**
  * A file this client keeps in its home: the client, the credential, the
  * state and logs, the plan files, the two flags, the lanes each session
- * holds, what each session was told and the plan sync (client 1.11.0), and
- * each one's lock, rotation (.1) and the temp file a write goes through.
+ * holds, what each session was told and the plan sync (client 1.11.0), the
+ * collision prompts remembered (SECTION 12b), and each one's lock, rotation
+ * (.1) and the temp file a write goes through.
  */
 function hive_purge_is_home_file(string $name): bool
 {
     return preg_match('/^(?:hive\.php|\.env\.hive|state\.json|outbox\.ndjson|audit\.ndjson|plan-asked\.json|proceed\.json|progress\.log|plan\.log|notices|off'
-        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|plugin-root)'
+        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|prompts\.(?:json|lock)|plugin-root)'
         .'(?:\.lock|\.1|\.\d+(?:\.hive)?\.tmp)?$/', $name) === 1;
 }
 
@@ -18903,7 +19339,7 @@ function hive_verb_check(array $args): int
 
     try {
         $lines = in_array('--proceed', $args, true)
-            ? hive_check_proceed(hive_plan_words($args))
+            ? hive_check_proceed(hive_plan_words($args), 'proceed')
             : hive_check_run(hive_plan_words($args), $started);
     } catch (Throwable $e) {
         if (hive_env('HIVE_DEBUG') === '1') {
@@ -19320,6 +19756,9 @@ function hive_check_run(array $words, float $started): array
         // recommended answer, as if it were picked, instead of the pop-up.
         if (hive_policy_decide(hive_cache_load($slugs[0])) === 'auto') {
             $decided = hive_check_decide($asks, $cmd, $park, $mode, array_slice($follow, 0, 1), $brokerNext, $started + HIVE_CHECK_BUDGET);
+        } else {
+            // The pop-up, remembered for what follows it (SECTION 12b).
+            hive_check_remember('plan', $asks);
         }
     }
 
@@ -19758,10 +20197,18 @@ function hive_check_classify(array $response, array $files, array $gates): array
 
         // ---- anything else: a scope the agent did not name ------------------
         // A migration-table or migration-slot overlap names a table, not a
-        // file. Said when it is hard, never asked about.
+        // file. Said when it is hard, never asked about. Two new migrations
+        // on one table (batch 5: the answer's `table`) are said as that:
+        // nobody is "editing" a table, and the teammate holds their own
+        // migration, not the asker's. Without `table`, an older Hive's, the
+        // words are as they were.
         if ($severity === 'hard' && $scope !== '') {
+            $table = hive_safe_text(is_string($conflict['table'] ?? null) ? $conflict['table'] : null, 64);
             $items[] = hive_check_item('note', 1, 'NOTE '.hive_safe_text($gates['label'].$scope, HIVE_SAFE_PATH_MAX).': '
-                .$who.' '.$verb.$paren.': hard collision'.$slice);
+                .($table !== ''
+                    ? $who.' has an unpushed migration on the '.$table.' table too'.$paren.': two migrations on one table, hard collision;'
+                        .' agree with them which runs first and change the other before either is pushed'
+                    : $who.' '.$verb.$paren.': hard collision').$slice);
         }
     }
 
@@ -20349,13 +20796,17 @@ function hive_check_decide(array $asks, string $cmd, array $park, string $mode, 
     ['asks' => $asks] = hive_check_people($asks);
     $also = hive_check_ruled_step($ruled, $cmd);
 
+    // What it took, remembered for what follows it (SECTION 12b): any
+    // answer but Proceed anyway leaves the files as they are.
+    $choice = $follow !== [] ? 'follow' : hive_check_recommend($asks);
+    hive_check_remember($choice === 'proceed' ? 'auto_proceed' : 'auto_park', $asks);
+
     if ($follow !== []) {
         $step = (string) preg_replace('/^HIVE THEN Follow Hive\'s ruling \(recommended\): /', '', $follow[0]);
 
         return array_merge([HIVE_DECIDED.'Follow Hive\'s ruling', 'HIVE NEXT: '.$step], $also);
     }
 
-    $choice = hive_check_recommend($asks);
     $lines = [HIVE_DECIDED.HIVE_RECOMMEND_LABELS[$choice]];
     $parkRun = $park !== [] ? hive_park_commands($park, $cmd) : null;
     // The order Hive ruled for these files holds whatever the choice.
@@ -20400,7 +20851,11 @@ function hive_check_decide(array $asks, string $cmd, array $park, string $mode, 
  *   sent       Hive took a new request (result ask): the only "sent"
  *   open       the same request was already open at Hive (deduplicated)
  *   answered   Hive answered for the teammate from their estimate, or let
- *              this side go first on a structural file (go_ahead)
+ *              this side go first on a structural file (go_ahead) because
+ *              it could not reach them, or by their standing choice to let
+ *              teammates go first (go_ahead, reason consent: batch 5, read
+ *              only by a client that sends `want: ["go_ahead_consent"]`,
+ *              as every push request here does)
  *   off        autonomy is off for the repository, here or at Hive (403
  *              broker_off): nothing is sent
  *   capped     Hive's request caps (429)
@@ -20440,6 +20895,7 @@ function hive_check_push_requests(array $asks, float $budgetEnd): array
             if (hive_broker_may_send() && $deadline - microtime(true) >= 0.2) {
                 $result = hive_http('POST', '/progress/requests', [
                     'kind' => 'push', 'repo' => $repo, 'path_hash' => $hash, 'claim' => $id, 'client_session' => $digest,
+                    'want' => HIVE_BROKER_REQUEST_WANT,
                 ], 'progress', [], $deadline);
             }
             $status = $result !== null ? (int) $result['status'] : 0;
@@ -20452,7 +20908,7 @@ function hive_check_push_requests(array $asks, float $budgetEnd): array
                 $outcome = match ($json['result'] ?? null) {
                     'ask' => 'sent',
                     'deduplicated' => 'open',
-                    default => ($json['choice'] ?? null) === 'go_ahead' && ($json['reason'] ?? null) === 'unreachable' ? 'go_ahead' : 'answered',
+                    default => hive_broker_went_first($json) ?? 'answered',
                 };
             } elseif ($status === 403 && $code === 'broker_off') {
                 $outcome = 'off';
@@ -20482,6 +20938,8 @@ function hive_check_push_requests(array $asks, float $budgetEnd): array
             'answered' => 'Hive answered for '.$who.' from their own estimate: their push of '.$files.' is expected soon, with no promise',
             'go_ahead' => 'Hive could not reach '.$who.'\'s agent, so it let you go first on '.$files.', and check answers again for '
                 .(count($group['files']) === 1 ? 'it' : 'them'),
+            'consent' => $who.'\'s standing choice lets you go first on '.$files.', and check answers again for '
+                .(count($group['files']) === 1 ? 'it' : 'them'),
             'off' => 'autonomy is off for '.$group['detail'].', so no push request went to '.$who,
             'capped' => 'Hive\'s request caps are reached, so no push request went to '.$who,
             'refused' => 'Hive refused a push request to '.$who.' for '.$files.' ('.$group['detail'].')',
@@ -20493,6 +20951,28 @@ function hive_check_push_requests(array $asks, float $budgetEnd): array
     }
 
     return $facts;
+}
+
+/**
+ * Each question `check` put, or answered by the developer's auto-accept
+ * setting, remembered as a $surface prompt about its file and the
+ * teammate's claim, in the agent's session (SECTION 12b).
+ *
+ * @param  list<array<string, mixed>>  $asks
+ */
+function hive_check_remember(string $surface, array $asks): void
+{
+    $digest = hive_agent_session_digest();
+    $notes = [];
+    foreach ($asks as $ask) {
+        $slug = hive_str($ask['slug'] ?? null);
+        $rel = hive_str($ask['rel'] ?? null);
+        if ($slug !== null && $rel !== null && $rel !== '') {
+            $notes[] = [$surface, $slug, hive_path_hash($rel), hive_str($ask['id'] ?? null), $digest];
+        }
+    }
+    // One locked write for the whole check.
+    hive_prompts_note_all($notes);
 }
 
 /**
@@ -20538,10 +21018,13 @@ function hive_check_length(string $text): int
  * and flush still tell them. A file nobody asked about records nothing -- the
  * edit-time prompt and the wake-up stay exactly as they were for it.
  *
+ * With $surface (`proceed`, the verb's own), each file and claim recorded is
+ * also remembered as a prompt, for what follows it (SECTION 12b).
+ *
  * @param  list<string>  $words
  * @return list<string>
  */
-function hive_check_proceed(array $words): array
+function hive_check_proceed(array $words, ?string $surface = null): array
 {
     if ($words === []) {
         return ['HIVE PROCEED: name the files the developer chose to proceed with.'];
@@ -20562,6 +21045,7 @@ function hive_check_proceed(array $words): array
     $stamps = [];
     $recorded = [];
     $lines = [];
+    $notes = [];
 
     foreach ($resolved['items'] as $item) {
         $label = hive_safe_text($item['label'], HIVE_SAFE_PATH_MAX);
@@ -20606,6 +21090,15 @@ function hive_check_proceed(array $words): array
         unset($proceed[$key]);
         $proceed[$key] = ['at' => $now, 'claims' => array_map('strval', array_keys($claims))];
 
+        // The developer's own Proceed anyway, remembered for what follows
+        // it (SECTION 12b), in one write below; auto-accept's is
+        // remembered where it is taken.
+        if ($surface !== null) {
+            foreach (array_keys($claims) as $id) {
+                $notes[] = [$surface, $item['slug'], hive_path_hash($item['rel']), (string) $id, hive_agent_session_digest()];
+            }
+        }
+
         foreach ($claims as $claim) {
             $scope = hive_str($claim['scope'] ?? null);
             $dev = hive_str($claim['dev'] ?? null);
@@ -20622,6 +21115,7 @@ function hive_check_proceed(array $words): array
     if ($proceed !== null) {
         hive_plan_save('proceed.json', $proceed);
     }
+    hive_prompts_note_all($notes);
 
     // Re-read just before writing, and only a cache that exists: made from
     // nothing, it would look like a fresh, empty picture to the gate.
@@ -30850,6 +31344,11 @@ function hive_progress_verb_park(array $args): int
         return hive_progress_out(['Nobody can answer a question in this session, so nothing was parked.'],
             'HIVE NEXT: A headless run never parks. Leave those files, carry on with the rest, and name who holds them first in your final answer.', 2);
     }
+    // The developer's answer to the prompts this session was just put in
+    // that repository: park (SECTION 12b), whether or not the park lands.
+    if ($asked) {
+        hive_prompts_answer('parked', $repoArg, null, hive_agent_session_digest());
+    }
     if ($slices && hive_work_off()) {
         return hive_work_off_out();
     }
@@ -39188,6 +39687,11 @@ function hive_broker_block($raw): array
                 'live' => ($other['live'] ?? false) === true,
             ],
             'message' => $ruling['message'] ?? null,
+            // The keeper of a push then yield waits only for the other
+            // side's push (docs/api/broker.md): said by the ruling's own
+            // `reason`, or else by its ruling.yield message's, below; a
+            // block this client kept says it as it read it.
+            'push_first' => ($ruling['reason'] ?? null) === 'push_first' || ($ruling['push_first'] ?? false) === true,
         ];
     }
 
@@ -39279,6 +39783,20 @@ function hive_broker_block($raw): array
             'urgent' => ($message['urgent'] ?? false) === true,
             'at' => hive_broker_typed('time', $message['at'] ?? null),
         ];
+    }
+
+    // A ruling Hive sends without its `reason` (GET /progress/inbox and a
+    // picture's block do) still carries it in its ruling.yield message.
+    $pushFirst = [];
+    foreach ($messages as $message) {
+        if ($message['code'] === 'ruling.yield' && ($message['params']['reason'] ?? null) === 'push_first') {
+            $pushFirst[$message['message']] = true;
+        }
+    }
+    foreach ($rulings as $i => $ruling) {
+        if (! $ruling['push_first'] && $ruling['you'] === 'yield' && is_string($ruling['message']) && isset($pushFirst[$ruling['message']])) {
+            $rulings[$i]['push_first'] = true;
+        }
     }
 
     return [
@@ -44707,7 +45225,8 @@ function hive_progress_verb_ask(array $args): int
             return hive_progress_out(['No teammate holds '.$subject.' hard in Hive\'s picture here, so there is nobody to ask.'],
                 'HIVE NEXT: Go ahead; the edit-time check still applies.', 2);
         }
-        $body = ['kind' => 'push', 'repo' => $repo, 'path_hash' => $hash, 'claim' => $claim, 'client_session' => $digest];
+        $body = ['kind' => 'push', 'repo' => $repo, 'path_hash' => $hash, 'claim' => $claim, 'client_session' => $digest,
+            'want' => HIVE_BROKER_REQUEST_WANT];
     }
 
     $result = hive_http('POST', '/progress/requests', $body, 'progress', [], microtime(true) + HIVE_PROGRESS_WRITE_BUDGET);
@@ -44749,9 +45268,17 @@ function hive_progress_verb_ask(array $args): int
         case 'answered':
             // Client 1.16.0: Hive could not reach the holder's agent and let
             // this one go first at once (`choice` go_ahead, `reason`
-            // unreachable). Older clients print the estimate's words below.
-            if ($kind === 'push' && ($json['choice'] ?? null) === 'go_ahead' && ($json['reason'] ?? null) === 'unreachable') {
+            // unreachable). Batch 5: the holder's standing choice to let
+            // teammates go first did (reason consent), which Hive answers
+            // only to the `want` this client sends. Older clients print the
+            // estimate's words below.
+            $first = $kind === 'push' ? hive_broker_went_first($json) : null;
+            if ($first === 'go_ahead') {
                 return hive_progress_out(['Hive could not reach their agent, so it let you go first on '.$subject.': it is yours now. Commit and push your branch as soon as this step\'s tests pass.'],
+                    'HIVE NEXT: Go ahead with that file; the edit-time check still applies.', 0);
+            }
+            if ($first === 'consent') {
+                return hive_progress_out(['Their standing choice lets you go first on '.$subject.': it is yours now. Commit and push your branch as soon as this step\'s tests pass; their agent waits on it.'],
                     'HIVE NEXT: Go ahead with that file; the edit-time check still applies.', 0);
             }
 
@@ -46676,6 +47203,12 @@ const HIVE_BROKER_SEEN_MAX = 50;
 const HIVE_BROKER_CASES_MAX = 200;
 const HIVE_BROKER_HANDED_MAX = 20;
 const HIVE_BROKER_ASKS_MAX = 5;
+// What every push request says this client reads (docs/api/broker.md,
+// POST /progress/requests `want`): a go_ahead Hive answers by the holder's
+// standing choice to let teammates go first (batch 5). Without it Hive asks
+// the holder as before, so an older Hive, or one that ignores it, is
+// unchanged.
+const HIVE_BROKER_REQUEST_WANT = ['go_ahead_consent'];
 const HIVE_BROKER_PUSH_PATHS_MAX = 100;
 const HIVE_BROKER_PUSH_BYTES_MAX = 6000;
 const HIVE_PHANTOM_CHECK_OVER = 36;
@@ -50036,7 +50569,8 @@ function hive_broker_gate(array $cache, string $repo, string $relative, string $
         $branch = hive_safe_text($found['claim']['branch'] ?? null, HIVE_SAFE_BRANCH_MAX);
         $who = 'your other lane'.($branch !== '' ? ' ('.$branch.')' : '');
     }
-    $words = hive_broker_gate_words($you, $rule, $who, $ruling === null);
+    $pushFirst = ! empty($ruling['push_first']);
+    $words = hive_broker_gate_words($you, $rule, $who, $ruling === null, $pushFirst);
 
     // The developer's override: of this ruling, by its case, or -- once Hive
     // has resolved the overridden case and its ruling has left the block --
@@ -50081,7 +50615,7 @@ function hive_broker_gate(array $cache, string $repo, string $relative, string $
         hive_broker_gate_count('deny', $sample, $now);
 
         return ['decision' => 'deny', 'case' => $case, 'reason' => hive_broker_gate_refusal(
-            $name, (string) ($context['shown'] ?? $relative), $relative, $who, $rule, $found['age'], $case,
+            $name, (string) ($context['shown'] ?? $relative), $relative, $who, $rule, $found['age'], $case, $pushFirst,
         )];
     }
     if ($overridden) {
@@ -50278,9 +50812,11 @@ function hive_broker_gate_holds(array $cache, string $hash): bool
 
 /**
  * A rule in the words the gate says it in, from where this viewer stands:
- * "plan order", "their change began first".
+ * "plan order", "their change began first". $pushFirst: the viewer yields
+ * only until the other side pushes first (a push then yield's keeper,
+ * `reason` push_first).
  */
-function hive_broker_rule_words(string $rule, string $you): string
+function hive_broker_rule_words(string $rule, string $you, bool $pushFirst = false): string
 {
     $theirs = $you !== 'keep';
 
@@ -50301,6 +50837,21 @@ function hive_broker_rule_words(string $rule, string $you): string
             return 'less time left';
         case 'stable_order':
             return 'a tie';
+        case 'waived':
+            // A standing choice to let teammates go first gave it up, at
+            // ruling time or by answering a push request (batch 5). The side
+            // that goes first -- keep, or commit a structural file first --
+            // has the other's choice to thank; a side that goes second, or
+            // pushes first and then leaves the file, made it. Under R5 a
+            // waiver that is the incumbent with work on its own lane pushes
+            // first, and the side that did not choose waits for that push
+            // (yield, push_first): it is theirs, not this viewer's, choice.
+            if ($pushFirst) {
+                return 'they chose to let teammates go first';
+            }
+
+            return in_array($you, ['keep', 'serialize_first'], true)
+                ? 'their standing choice lets you go first' : 'your standing choice lets teammates go first';
         case 'cycle_break':
             return 'a wait cycle';
         default:
@@ -50312,9 +50863,9 @@ function hive_broker_rule_words(string $rule, string $you): string
  * What the gate says of a ruling, stage 1's words: "Hive ruled: lamont-kedo
  * keeps this file (plan order)". With none yet ($local), R5's.
  */
-function hive_broker_gate_words(string $you, string $rule, string $who, bool $local): string
+function hive_broker_gate_words(string $you, string $rule, string $who, bool $local, bool $pushFirst = false): string
 {
-    $why = hive_broker_rule_words($rule, $you);
+    $why = hive_broker_rule_words($rule, $you, $pushFirst);
 
     if ($local) {
         return 'Hive\'s default: '.$who.' keeps this file ('.$why.')';
@@ -50343,10 +50894,10 @@ function hive_broker_gate_words(string $you, string $rule, string $who, bool $lo
  * With no case yet, the way to one: `check` gives a ruling, and its park
  * makes it a case.
  */
-function hive_broker_gate_refusal(string $name, string $shown, string $relative, string $who, string $rule, int $age, ?string $case): string
+function hive_broker_gate_refusal(string $name, string $shown, string $relative, string $who, string $rule, int $age, ?string $case, bool $pushFirst = false): string
 {
     $cmd = hive_self_command();
-    $text = 'HIVE RULING (yield, '.hive_broker_rule_words($rule, 'yield').'): '.$who.' keeps '.$shown
+    $text = 'HIVE RULING (yield, '.hive_broker_rule_words($rule, 'yield', $pushFirst).'): '.$who.' keeps '.$shown
         .($age !== PHP_INT_MAX ? ' and was active '.hive_ago($age).' ago' : '').', so this edit is refused. ';
 
     // With no case yet a plain park would wait on no ruling, and a headless
@@ -50505,6 +51056,29 @@ function hive_broker_gate_ask(string $repo, string $hash, string $claim, string 
 }
 
 /**
+ * Whether Hive's answer to a push request let the asker go first, and why:
+ * `go_ahead` when it could not reach the holder (client 1.16.0, reason
+ * unreachable), `consent` when the holder's standing choice to let
+ * teammates go first did (batch 5, reason consent), else null -- any other
+ * answer, or a go_ahead with a reason this client does not know, which is
+ * said as any answer is. Pure.
+ *
+ * @param  array<string, mixed>  $json  POST /progress/requests' 2xx body
+ */
+function hive_broker_went_first(array $json): ?string
+{
+    if (($json['result'] ?? null) !== 'answered' || ($json['choice'] ?? null) !== 'go_ahead') {
+        return null;
+    }
+
+    return match ($json['reason'] ?? null) {
+        'unreachable' => 'go_ahead',
+        'consent' => 'consent',
+        default => null,
+    };
+}
+
+/**
  * Sends the push requests the gate left for this session
  * (hive_broker_gate_ask()): POST /progress/requests, kind push, the file by
  * its hash and the keeper's claim (docs/api/broker.md), at most two a
@@ -50532,6 +51106,7 @@ function hive_broker_send_asks(string $digest): void
             'path_hash' => (string) $ask['path_hash'],
             'claim' => (string) $ask['claim'],
             'client_session' => $digest,
+            'want' => HIVE_BROKER_REQUEST_WANT,
         ], 'flush', [], microtime(true) + 3.0);
 
         if ($response['ok'] || ($response['status'] >= 400 && $response['status'] < 500)) {
@@ -51117,14 +51692,14 @@ function hive_broker_check_lines(array $answer, string $autonomy, string $cmd): 
 
         $who = $ruling['other']['login'] ?? 'a teammate';
         $shown = hive_safe_text((string) $file['label'], HIVE_SAFE_PATH_MAX);
-        $why = hive_broker_rule_words($ruling['rule'], $ruling['you']);
+        $why = hive_broker_rule_words($ruling['rule'], $ruling['you'], $ruling['push_first']);
         $park = $ruling['next'] === null ? null
             : hive_broker_next_line($ruling['next'], $cmd, ['files' => [$ruling['path_hash'] => (string) $file['rel']]]);
         $command = $park !== null && str_starts_with($park, 'HIVE NEXT: ') ? substr($park, 11) : null;
 
         if ($autonomy === 'suggest') {
             if ($ruling['you'] === 'yield' && $command !== null) {
-                $lines[] = 'RULING '.$shown.': '.hive_broker_gate_words('yield', $ruling['rule'], $who, false).'.';
+                $lines[] = 'RULING '.$shown.': '.hive_broker_gate_words('yield', $ruling['rule'], $who, false, $ruling['push_first']).'.';
                 $follow[] = 'HIVE THEN Follow Hive\'s ruling (recommended): '.$shown.' stays '.$who.'\'s; '.$command
                     .' puts the task on hold, and its HIVE NEXT says what follows.';
             }
@@ -51135,7 +51710,7 @@ function hive_broker_check_lines(array $answer, string $autonomy, string $cmd): 
         switch ($ruling['you']) {
             case 'yield':
                 $lines[] = $ruling['push_first']
-                    ? 'HIVE RULING yield: '.$who.' pushes '.$shown.' first, and then it is yours ('.hive_broker_rule_words($ruling['rule'], 'keep').'). Do not edit it until Hive wakes you.'
+                    ? 'HIVE RULING yield: '.$who.' pushes '.$shown.' first, and then it is yours ('.hive_broker_rule_words($ruling['rule'], 'keep', true).'). Do not edit it until Hive wakes you.'
                     : 'HIVE RULING yield: '.$who.' keeps '.$shown.' ('.$why.'). Do not edit it.';
                 if ($next === null && $command !== null) {
                     $next = 'HIVE NEXT: '.$command.' and carry on with your other files; Hive wakes you when it is free.';
