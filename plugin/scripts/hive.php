@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.21.0';
+const HIVE_VERSION = '1.21.1';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1765,8 +1765,12 @@ const HIVE_ACTIVITY_TOOL_KINDS = [
 ];
 const HIVE_ACTIVITY_SHELL_KINDS = ['commit', 'push', 'pr', 'review', 'test', 'build'];
 const HIVE_ACTIVITY_DIRTY_KINDS = ['edit', 'shell', 'commit', 'push', 'pr', 'review', 'test', 'build'];
-const HIVE_ACTIVITY_SEND_EVERY = 30;
-const HIVE_ACTIVITY_NEWS_AFTER = 10;
+// The live activity's two paces when no policy names them (batch 5's Task
+// 21; 30 and 10 before it): counts alone after a minute, riding the
+// heartbeat a working session makes each minute anyway, and no kind of work
+// sent as news. Hive ships and serves the same (config/hive.php).
+const HIVE_ACTIVITY_SEND_EVERY = 60;
+const HIVE_ACTIVITY_NEWS_AFTER = 0;
 const HIVE_ACTIVITY_NEWS_MEMORY = 120;
 const HIVE_ACTIVITY_NEWS_PER_MINUTE = 2;
 const HIVE_ACTIVITY_SUBAGENTS_MAX = 20;
@@ -47165,8 +47169,9 @@ function hive_park_ruling_run(array $ctx, array $schema, string $repo, string $m
 //   seconds old; or it holds news -- a kind of work in a repository that no
 //   report named in the last HIVE_ACTIVITY_NEWS_MEMORY seconds, a sub-agent
 //   starting or finishing -- and the last send is HIVE_ACTIVITY_NEWS_AFTER
-//   seconds old, HIVE_ACTIVITY_NEWS_PER_MINUTE times a minute at most
-//   (hive_activity_paces(): both paces are the policy's); else
+//   seconds old, HIVE_ACTIVITY_NEWS_PER_MINUTE times a minute at most, and
+//   never at 0, the shipped pace (hive_activity_paces(): both paces are the
+//   policy's); else
 //
 //   not at all: hive_activity_restore() puts it back, its counts beside
 //   whatever was counted since, and the next report carries them. So it
@@ -50082,7 +50087,7 @@ function hive_activity_send_pending(string $profile, float $seconds): void
  * the flush began and neither sent nor put back, is put back
  * (hive_activity_restore()), not sent: nothing more goes out of a hook in
  * that state. Without it the report's counts would be lost and its
- * sent_at would restart the 30 s clock with nothing said. Fails open.
+ * sent_at would restart the send pace's clock with nothing said. Fails open.
  */
 function hive_activity_abandon(): void
 {
