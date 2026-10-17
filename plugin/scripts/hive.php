@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.20.0';
+const HIVE_VERSION = '1.21.0';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1924,6 +1924,8 @@ function hive_main(array $argv): int
             case 'off':           return hive_verb_off();
             case 'on':            return hive_verb_on();
             case 'purge':         return hive_verb_purge($args);
+            // Board approvals' launcher (C2, SECTION 34c): its OS agent runs tick.
+            case 'launcher':      return hive_verb_launcher($args);
             case 'setup':         return hive_verb_setup($args);
             case 'version':       hive_line('hive.php '.HIVE_VERSION);
 
@@ -1991,6 +1993,8 @@ function hive_verb_help(bool $quiet): int
     hive_line('    audit [--full]    the last 20 outbound requests');
     hive_line('    off / on          kill switch for this machine');
     hive_line('    purge --yes       remove Hive from this computer: hooks, rules, .hive/, this folder');
+    hive_line('    launcher status   Hive\'s launcher, which opens a new Claude session for a board approval;');
+    hive_line('                      a session start installs or removes it (install, uninstall), its OS agent runs tick');
     hive_line('    version');
 
     return 0;
@@ -7790,7 +7794,8 @@ function hive_breaker_hold(string $host, int $seconds, string $reason): void
  *             1.12.0's, a session's label and a handover given or refused,
  *             the rooms' take of a developer's note and the agent's say,
  *             and the take of a board action the developer approved
- *             (SECTION 34b), capped by the hour too
+ *             (SECTION 34b) and, from the launcher, its outcome and the
+ *             launcher's state (SECTION 34c), capped by the hour too
  *             (hive.broker.caps.writes_per_hour)
  *
  * An hourly cap answers Retry-After up to the rest of the hour, and the
@@ -7812,10 +7817,10 @@ function hive_hold_class(string $method, string $path): ?string
     }
     if ($method === 'POST' && preg_match('#^/progress/(?:workplans/[^/]+/state|lanes/next|lanes/[^/]+/(?:lease|release)|autopilot|backlog/[^/]+/takeover'
         .'|backlog/[^/]+/handover(?:/refuse)?|inbox/[^/]+/answer|requests|decisions|cases/[^/]+/override|automations/[^/]+/(?:lease|report)'
-        .'|prompts/[^/]+/take|board-actions/[^/]+/take|says)$#', $route) === 1) {
+        .'|prompts/[^/]+/take|board-actions/[^/]+/(?:take|outcome)|says)$#', $route) === 1) {
         return 'broker';
     }
-    if ($method === 'PUT' && preg_match('#^/progress/sessions/[^/]+/label$#', $route) === 1) {
+    if ($method === 'PUT' && (preg_match('#^/progress/sessions/[^/]+/label$#', $route) === 1 || $route === '/progress/launcher')) {
         return 'broker';
     }
 
@@ -9234,6 +9239,13 @@ function hive_verb_session_start(): int
     $lines = hive_plugin_pending_lines([], true);
     if ($lines !== []) {
         hive_emit(['hookSpecificOutput' => ['hookEventName' => 'SessionStart', 'additionalContext' => hive_plugin_client_block($lines)]]);
+    }
+
+    // Board approvals' launcher (C2, SECTION 34c): installed, rewritten or
+    // removed as the policy this start fetched says, detached. Last: it
+    // closes this process's stdio.
+    if ($roots !== []) {
+        hive_launcher_upkeep(hive_session_load($input['session_id'] ?? 'default'));
     }
 
     return 0;
@@ -15241,6 +15253,35 @@ function hive_utf16_decode(string $bytes, bool $littleEndian): string
 }
 
 /**
+ * UTF-8 to UTF-16LE by hand, the other way from hive_utf16_decode(), with no
+ * byte order mark: what Windows reads as "Unicode" (the launcher's task XML,
+ * powershell -EncodedCommand). A letter beyond the BMP becomes its
+ * surrogate pair. Null for bytes that are not UTF-8: nothing is guessed.
+ */
+function hive_utf16le_encode(string $utf8): ?string
+{
+    if (preg_match('//u', $utf8) !== 1) {
+        return null;
+    }
+
+    $out = '';
+    foreach (preg_split('//u', $utf8, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $char) {
+        $b = array_values((array) unpack('C*', $char));
+        $code = match (count($b)) {
+            1 => $b[0],
+            2 => (($b[0] & 0x1F) << 6) | ($b[1] & 0x3F),
+            3 => (($b[0] & 0x0F) << 12) | (($b[1] & 0x3F) << 6) | ($b[2] & 0x3F),
+            default => (($b[0] & 0x07) << 18) | (($b[1] & 0x3F) << 12) | (($b[2] & 0x3F) << 6) | ($b[3] & 0x3F),
+        };
+        $out .= $code >= 0x10000
+            ? pack('v2', 0xD800 | (($code - 0x10000) >> 10), 0xDC00 | (($code - 0x10000) & 0x3FF))
+            : pack('v', $code);
+    }
+
+    return $out;
+}
+
+/**
  * The one-line title other developers see: the first line of the intent,
  * else "Work on <branch>". The server derives the same thing when a title is
  * missing, but 1.0 sent none and every PUT was a 422, so it is always sent.
@@ -16733,6 +16774,10 @@ function hive_verb_doctor(): int
     [$verdict, $detail] = hive_doctor_board_prompts();
     $add('board prompts', $verdict, $detail);
 
+    // ---- board approvals' launcher (C2, SECTION 34c) ------------------------
+    [$verdict, $detail] = hive_doctor_launcher();
+    $add('launcher', $verdict, $detail);
+
     // ---- the rules' topics (1.18.0): what `progress help` prints ----------------
     [$verdict, $detail] = hive_doctor_topics();
     $add('rules topics', $verdict, $detail);
@@ -17425,8 +17470,13 @@ function hive_verb_on(): int
  *   4. Last, backups/, moved out beside the home rather than deleted: it is
  *      how anything purge took out comes back (hive_purge_backups).
  *
+ * Between 1 and 2, board approvals' launcher (C2, SECTION 34c): its OS
+ * agent unloaded and removed, as `launcher uninstall` does, before the
+ * client it runs goes (hive_purge_launcher()).
+ *
  * It revokes nothing, since only an owner can, in /hq; the last line says
- * so. It sends nothing, and never prints the token.
+ * so. It sends nothing but, when it removed a launcher, that launcher's
+ * `removed` (PUT /progress/launcher), and never prints the token.
  *
  * A human verb: a refusal goes to stderr, and the exit code is 1 when
  * something of Hive's is left that the developer must remove by hand.
@@ -17560,6 +17610,21 @@ function hive_verb_purge(array $args): int
             $left = true;
             hive_purge_step('Plugin', 'switched off, with automatic updates off, but still installed: '.$why);
             hive_purge_note('It stays until /plugin uninstalls velu-hive'.($claude !== null ? ', or claude plugin uninstall '.HIVE_PLUGIN_ID.' does' : '').'.');
+        }
+    }
+
+    // ---- 1c. board approvals' launcher (C2, SECTION 34c) -------------------------
+    // Its OS agent runs this client every minute: unloaded and removed before
+    // the client goes, and Hive told `removed`. Nothing at all when none is here.
+    $launcher = hive_purge_launcher();
+    if ($launcher !== null) {
+        $found = true;
+        hive_purge_step('Launcher', $launcher[1]);
+        if ($launcher[0] === 'failed') {
+            $left = true;
+            hive_purge_note(hive_launcher_os() === 'Darwin'
+                ? 'launchctl bootout gui/'.hive_launcher_uid().'/'.hive_launcher_label().' unloads it, and the file can then be deleted.'
+                : 'schtasks /Delete /TN "'.HIVE_LAUNCHER_TASK.'" /F removes it.');
         }
     }
 
@@ -18308,8 +18373,9 @@ function hive_purge_copied_text(int $tasks, int $others): string
  * installer brought -- and everything in it goes. A HIVE_HOME elsewhere
  * may be a folder that holds other things too, so there only the files
  * Hive keeps go, by the names it gives them (hive_purge_is_home_file(), and
- * in sessions/, cache/, progress/, plans/, workplans/, workplans/spool/ and
- * topics/ hive_purge_is_state_file()), and every other entry is kept.
+ * in sessions/, cache/, progress/, plans/, workplans/, workplans/spool/,
+ * topics/ and launch/ hive_purge_is_state_file()), and every other entry is
+ * kept.
  *
  * @return array{failed: list<string>, kept: list<string>}  the entries left, by name
  */
@@ -18330,7 +18396,7 @@ function hive_purge_home(string $home, bool $whole): array
             if (! hive_purge_remove_tree($path)) {
                 $out['failed'][] = $name;
             }
-        } elseif (in_array($name, ['sessions', 'cache', 'progress', 'plans', 'workplans', 'topics'], true) && is_dir($path) && ! is_link($path)) {
+        } elseif (in_array($name, ['sessions', 'cache', 'progress', 'plans', 'workplans', 'topics', 'launch'], true) && is_dir($path) && ! is_link($path)) {
             $failed = false;
             // workplans/spool: the plans a capture has not sent yet.
             $spool = $path.'/spool';
@@ -18372,13 +18438,14 @@ function hive_purge_home(string $home, bool $whole): array
  * A file this client keeps in its home: the client, the credential, the
  * state and logs, the plan files, the two flags, the lanes each session
  * holds, what each session was told and the plan sync (client 1.11.0), the
- * collision prompts remembered (SECTION 12b), and each one's lock, rotation
- * (.1) and the temp file a write goes through.
+ * collision prompts remembered (SECTION 12b), the launcher's launcher.json,
+ * tick lock and Windows task XML (SECTION 34c), and each one's lock, rotation (.1) and the
+ * temp file a write goes through.
  */
 function hive_purge_is_home_file(string $name): bool
 {
     return preg_match('/^(?:hive\.php|\.env\.hive|state\.json|outbox\.ndjson|audit\.ndjson|plan-asked\.json|proceed\.json|progress\.log|plan\.log|notices|off'
-        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|prompts\.(?:json|lock)|plugin-root)'
+        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|prompts\.(?:json|lock)|plugin-root|launcher\.(?:json|lock)|launcher-task\.xml)'
         .'(?:\.lock|\.1|\.\d+(?:\.hive)?\.tmp)?$/', $name) === 1;
 }
 
@@ -18392,7 +18459,8 @@ function hive_purge_is_home_file(string $name): bool
  * .watch.lock (SECTION 18e), <32 hex>.prompts.json and its lock (SECTION 34), <32 hex>.watch.root (SECTION 34b), .next.json (SECTION 18f), plans/<32 hex>.json, .lock and .sync
  * (hive_spool_path) and .swept, workplans/<32 hex>.plan-files.json and .lock
  * and workplans/spool/<32 hex>.json (SECTION 30), topics/<topic>.md for
- * each of HIVE_RULES_TOPICS (client 1.18.0), and
+ * each of HIVE_RULES_TOPICS (client 1.18.0), launch/<ulid>.txt, .command
+ * and .ps1 (SECTION 34c), and
  * the temp file a write of one goes through. Anything else in those folders
  * is not Hive's to delete.
  */
@@ -18409,6 +18477,8 @@ function hive_purge_is_state_file(string $folder, string $name): bool
         'spool' => '[0-9a-f]{32}\.json',
         // The rules' topics setup writes (client 1.18.0).
         'topics' => '(?:'.implode('|', HIVE_RULES_TOPICS).')\.md',
+        // A launch's line and opener (SECTION 34c), by the action's ulid.
+        'launch' => '[0-9A-HJKMNP-TV-Z]{26}\.(?:txt|command|ps1)',
     ];
 
     return isset($shapes[$folder]) && preg_match('/^'.$shapes[$folder].'(?:\.\d+(?:\.hive)?\.tmp)?$/', $name) === 1;
@@ -36497,12 +36567,46 @@ function hive_claude_run(string $claude, array $args, int $timeoutMs, ?string $c
  */
 function hive_setup_find_claude(): ?array
 {
+    foreach (hive_setup_claude_candidates() as $candidate) {
+        if (! hive_setup_claude_usable($candidate)) {
+            continue;
+        }
+
+        $run = hive_claude_run($candidate, ['--version'], 5000);
+        $version = ! $run['timed_out'] && $run['code'] === 0 && preg_match('/\b(\d+\.\d+\.\d+)\b/', $run['out'], $m) === 1 ? $m[1] : null;
+
+        return ['path' => $candidate, 'version' => $version];
+    }
+
+    return null;
+}
+
+/**
+ * Is $candidate a `claude` this computer can start: a file and, off
+ * Windows (hive_setup_os_family()), executable. hive_setup_find_claude()
+ * and the launcher (hive_launcher_claude()) take the first that is.
+ */
+function hive_setup_claude_usable(string $candidate): bool
+{
+    return @is_file($candidate) && (hive_setup_os_family() === 'Windows' || @is_executable($candidate));
+}
+
+/**
+ * Where hive_setup_find_claude() looks for `claude`, in its order: PATH's
+ * absolute folders ($path's when given: the launcher's own PATH), ~/.local/bin and ~/.claude/local, the editor
+ * extensions' (hive_setup_extension_claudes()) and, on Windows, npm's
+ * %APPDATA%\npm. Paths only: nothing here is started.
+ *
+ * @return list<string>
+ */
+function hive_setup_claude_candidates(?string $path = null): array
+{
     $windows = hive_setup_os_family() === 'Windows';
     $names = $windows ? ['claude.exe', 'claude.cmd'] : ['claude'];
     $name = $names[0];
     $candidates = [];
 
-    foreach (explode(PATH_SEPARATOR, (string) getenv('PATH')) as $dir) {
+    foreach (explode(PATH_SEPARATOR, $path ?? (string) getenv('PATH')) as $dir) {
         $dir = hive_normalise_slashes(trim($dir));
         if ($dir !== '' && ($dir[0] === '/' || preg_match('#^[A-Za-z]:/#', $dir) === 1)) {
             foreach ($names as $each) {
@@ -36522,18 +36626,7 @@ function hive_setup_find_claude(): ?array
         $candidates[] = hive_normalise_slashes(trim($appData)).'/npm/claude.cmd';
     }
 
-    foreach ($candidates as $candidate) {
-        if (! @is_file($candidate) || (! $windows && ! @is_executable($candidate))) {
-            continue;
-        }
-
-        $run = hive_claude_run($candidate, ['--version'], 5000);
-        $version = ! $run['timed_out'] && $run['code'] === 0 && preg_match('/\b(\d+\.\d+\.\d+)\b/', $run['out'], $m) === 1 ? $m[1] : null;
-
-        return ['path' => $candidate, 'version' => $version];
-    }
-
-    return null;
+    return $candidates;
 }
 
 /**
@@ -36580,8 +36673,9 @@ function hive_setup_extension_claudes(string $home, bool $windows): array
 
 /**
  * The OS setup's Windows gate checks: HIVE_SETUP_OS_FAMILY when it names one
- * (so the gate can be tested anywhere), else this one. Only the gate and the
- * names hive_setup_find_claude() looks for read it.
+ * (so the gate can be tested anywhere), else this one. Only the gate, the
+ * names hive_setup_find_claude() looks for, and the launcher's choice of OS
+ * agent and terminal (hive_launcher_os(), SECTION 34c) read it.
  */
 function hive_setup_os_family(): string
 {
@@ -53983,6 +54077,1968 @@ function hive_board_watch_kept(array $session, string $digest, array $input): bo
     }
 
     return false;
+}
+
+// =============================================================================
+// SECTION 34c -- the launcher: a new Claude session when none is live (C2)
+// =============================================================================
+//
+// docs/api/board-actions.md, "(C2) The launcher". When no session on the
+// computer a developer chose can take a board approval, the launcher opens a
+// new one there. It is a per-user OS agent that runs this client every 60
+// seconds (`launcher tick`), from the loader, so a plugin update carries new
+// code without a reinstall:
+//
+//   macOS     a LaunchAgent, ~/Library/LaunchAgents/media.velu.hive.launcher.plist
+//             (hive_launcher_plist()), loaded with launchctl bootout, then
+//             bootstrap gui/<uid>
+//   Windows   a Scheduled Task, "Velu Hive\Launcher", every minute, under
+//             php-win.exe so no console flashes, created from its XML
+//             (hive_launcher_task_xml()) so it runs on battery too; it runs
+//             only while the developer is logged on. Without php-win.exe:
+//             unsupported
+//   Linux     unsupported
+//
+// Nobody installs it by hand: a session start does (hive_launcher_upkeep(),
+// Task 6) once the developer has switched it on for the computer, with an
+// authenticator code, and the policy says board.launch true. The tick polls
+// GET /progress/board-actions/launches (an ETag; 304 while nothing waits),
+// takes at most one launch with `via: launch`, opens it, and reports the
+// outcome. HIVE_BOARD_LAUNCH=0 keeps it off on this computer.
+//
+// Test-only, read from the real environment alone (never an env file) and
+// only while HIVE_LAUNCHER_TESTING=1 is set there too (hive_launcher_testing()):
+// a project's .claude/settings.json `env` reaches a session start, so one
+// variable alone must not be enough. HIVE_LAUNCHER_RUNNER runs every program
+// the launcher starts (launchctl, schtasks, the openers) as [runner,
+// program, args...] instead, so tests record what would run and nothing
+// does; HIVE_LAUNCHER_LABEL gives the LaunchAgent a scratch label of its own
+// family (media.velu.hive.launcher<suffix>: a rehearsal with a scratch
+// HOME); HIVE_LAUNCHER_PACE, `<every>:<until>` seconds, shortens the hot
+// pace (5:55) for a test.
+// =============================================================================
+
+/*
+| LaunchPrompt's constants, character for character (ClientLauncherParityTest):
+| the one line a launch opens `claude` with, in the developer's own voice
+| (docs/api/board-actions.md, "The launch prompt"). `{ref}`, `{holder}` and
+| `{reason}` are take's, `{plan_sentence}` one of the two plan sentences.
+| A line has no newline, not even at its end.
+*/
+const HIVE_LAUNCH_CLAIM = 'Claim the superpowers board item {ref} for me: I approved it on the Hive board. {plan_sentence} That approval covers one '
+    .'command, to run once from this folder (the velu-workspace root), exactly as written, without asking me again; progress.mjs start, '
+    .'republishing the superpowers dashboard and anything more wait for me here. The command: node scripts/progress.mjs claim {ref}';
+const HIVE_LAUNCH_TAKEOVER = 'Take over the superpowers board item {ref} from {holder} for me: I approved the takeover on the Hive board. {plan_sentence} '
+    .'That approval covers one command, to run once from this folder (the velu-workspace root), exactly as written, without asking me again; '
+    .'telling {holder} why, progress.mjs start, republishing the superpowers dashboard and anything more wait for me here. The command: node '
+    ."scripts/progress.mjs claim {ref} --takeover '{reason}'";
+const HIVE_LAUNCH_PLAN = 'Its plan is {plan}.';
+const HIVE_LAUNCH_NO_PLAN = 'It has no plan file yet.';
+/** Every line, whole: a letter first, then only these. */
+const HIVE_LAUNCH_LINE = '/\A[A-Za-z][A-Za-z0-9 .,:;()\/#+_?\'-]*\z/';
+/** The longest line, in bytes. */
+const HIVE_LAUNCH_MAX = 1200;
+/** What a launch's line may not hold: Claude Code reads it in a user turn as a file to attach. */
+const HIVE_LAUNCH_MENTION = '/@/';
+
+/** The LaunchAgent's label, and its file's name under ~/Library/LaunchAgents. */
+const HIVE_LAUNCHER_LABEL = 'media.velu.hive.launcher';
+/** The Scheduled Task, in its own folder of Task Scheduler. */
+const HIVE_LAUNCHER_TASK = 'Velu Hive\\Launcher';
+/** How often the OS agent runs a tick, in seconds. */
+const HIVE_LAUNCHER_INTERVAL = 60;
+/** The Scheduled Task's time trigger starts here, in the past, and repeats every minute for ever. */
+const HIVE_LAUNCHER_TASK_START = '2026-01-01T00:00:00';
+/** How long Task Scheduler lets one tick run before it stops it. */
+const HIVE_LAUNCHER_TASK_LIMIT = 'PT2M';
+/** PUT /progress/launcher's states (docs/api/board-actions.md, "The launcher's state"). */
+const HIVE_LAUNCHER_STATES = ['installed', 'failed', 'removed', 'unsupported'];
+/** POST /progress/board-actions/{action}/outcome's outcomes. */
+const HIVE_LAUNCH_OUTCOMES = ['opened', 'no_terminal', 'no_claude', 'no_workspace', 'unsupported'];
+/** board.poll_seconds when the policy serves none, and its range (config/hive.php's). */
+const HIVE_LAUNCHER_POLL = 60;
+const HIVE_LAUNCHER_POLL_MIN = 30;
+const HIVE_LAUNCHER_POLL_MAX = 300;
+/** A tick polls when poll_seconds less this have passed: the OS agent's minute is not exact. */
+const HIVE_LAUNCHER_POLL_SLACK = 5;
+/** While Hive says hot: a poll every HOT_EVERY seconds until HOT_UNTIL seconds into the tick. */
+const HIVE_LAUNCHER_HOT_EVERY = 5;
+const HIVE_LAUNCHER_HOT_UNTIL = 55;
+/** A 401, 403 or 404 from the poll holds every poll for this long. */
+const HIVE_LAUNCHER_HOLD = 3600;
+/** How long launchctl, schtasks or an opener may take, in milliseconds. */
+const HIVE_LAUNCHER_RUN_MS = 10000;
+/** How long a launch is remembered here, an outcome is said again, and a launch file kept. */
+const HIVE_LAUNCHER_KEEP = 3600;
+/** The longest launch Hive serves (launch_expire_minutes' top): never opened older. */
+const HIVE_LAUNCH_EXPIRE_MAX = 1800;
+/** What the OS agent's PATH ends with, after the folders of php, claude and HIVE_LAUNCHER_TOOLS. */
+const HIVE_LAUNCHER_SYSTEM_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const HIVE_LAUNCHER_TOOLS = ['node', 'git', 'gh'];
+/** The environment the OS agent carries over when set: where Claude Code and Hive keep their files. */
+const HIVE_LAUNCHER_ENV = ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_PLUGIN_CACHE_DIR', 'HIVE_HOME'];
+
+// -----------------------------------------------------------------------------
+// Where, and whether
+// -----------------------------------------------------------------------------
+
+/** The OS the launcher works for: Darwin, Windows or another (hive_setup_os_family()). */
+function hive_launcher_os(): string
+{
+    return hive_setup_os_family();
+}
+
+/** The OS as a person names it, for the verbs' lines. */
+function hive_launcher_os_name(): string
+{
+    $os = hive_launcher_os();
+
+    return $os === 'Darwin' ? 'macOS' : ($os === 'Windows' ? 'Windows' : $os);
+}
+
+/** HIVE_BOARD_LAUNCH: false when the developer keeps the launcher off on this computer. */
+function hive_launcher_on(): bool
+{
+    $value = strtolower(trim((string) hive_env('HIVE_BOARD_LAUNCH', '1')));
+
+    return ! in_array($value, ['0', 'off', 'false', 'no'], true);
+}
+
+/** Whether the launcher's test settings are read: HIVE_LAUNCHER_TESTING=1 in the real environment. */
+function hive_launcher_testing(): bool
+{
+    return getenv('HIVE_LAUNCHER_TESTING') === '1';
+}
+
+/**
+ * The LaunchAgent's label: HIVE_LAUNCHER_LABEL, or, while testing
+ * (hive_launcher_testing()), a rehearsal's scratch label of its own family,
+ * HIVE_LAUNCHER_LABEL followed by `-` or `.` and more.
+ */
+function hive_launcher_label(): string
+{
+    $label = hive_launcher_testing() ? getenv('HIVE_LAUNCHER_LABEL') : false;
+
+    return is_string($label) && strlen($label) <= 128 && preg_match('/\A[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\z/', $label) === 1
+        && preg_match('/\A'.preg_quote(HIVE_LAUNCHER_LABEL, '/').'(?:[.-][A-Za-z0-9.-]+)?\z/', $label) === 1
+        ? $label
+        : HIVE_LAUNCHER_LABEL;
+}
+
+/** The LaunchAgent's file, under this user's home. */
+function hive_launcher_plist_path(): string
+{
+    return hive_user_home().'/Library/LaunchAgents/'.hive_launcher_label().'.plist';
+}
+
+/** <home>/launcher.json: the tick's last poll, what it took, and what Hive was told. */
+function hive_launcher_state_path(): string
+{
+    return hive_home().'/launcher.json';
+}
+
+/**
+ * The broker block's `board` as the launcher reads it
+ * (docs/api/board-actions.md, "The policy's board.launch"): `launch` true
+ * or false as served, null when the policy serves none (a Hive before C2,
+ * or no board block at all); `poll_seconds` held to its range, else 60.
+ *
+ * @return array{launch: ?bool, poll_seconds: int}
+ */
+function hive_launcher_policy(?array $cache): array
+{
+    $broker = hive_policy_value($cache, 'broker', null);
+    $board = is_array($broker) && is_array($broker['board'] ?? null) ? $broker['board'] : [];
+    $launch = $board['launch'] ?? null;
+    $poll = $board['poll_seconds'] ?? null;
+
+    return [
+        'launch' => is_bool($launch) ? $launch : null,
+        'poll_seconds' => is_int($poll) ? max(HIVE_LAUNCHER_POLL_MIN, min(HIVE_LAUNCHER_POLL_MAX, $poll)) : HIVE_LAUNCHER_POLL,
+    ];
+}
+
+/**
+ * Why this computer cannot run the launcher, or null when it can: Linux
+ * and every other OS, and Windows without php-win.exe beside the pinned
+ * PHP (a console would flash every minute).
+ */
+function hive_launcher_unsupported(): ?string
+{
+    $os = hive_launcher_os();
+    if ($os === 'Darwin') {
+        return null;
+    }
+    if ($os === 'Windows') {
+        return hive_launcher_phpw() === null ? 'Windows without php-win.exe beside '.hive_setup_php() : null;
+    }
+
+    return $os;
+}
+
+/** php-win.exe beside the pinned PHP (hive_setup_php()), or null. */
+function hive_launcher_phpw(): ?string
+{
+    $phpw = dirname(hive_setup_php()).'/php-win.exe';
+
+    return @is_file($phpw) ? $phpw : null;
+}
+
+/**
+ * The `claude` a launch opens: the first hive_setup_find_claude() would
+ * find, without starting it, on this PATH or on $path. Null when there is
+ * none.
+ */
+function hive_launcher_claude(?string $path = null): ?string
+{
+    foreach (hive_setup_claude_candidates($path) as $candidate) {
+        if (hive_setup_claude_usable($candidate)) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+/** The first $name on PATH (absolute folders only) that is an executable file, as found. */
+function hive_launcher_tool(string $name): ?string
+{
+    foreach (explode(PATH_SEPARATOR, (string) getenv('PATH')) as $dir) {
+        $dir = rtrim(hive_normalise_slashes(trim($dir)), '/');
+        if ($dir === '' || ($dir[0] !== '/' && preg_match('#^[A-Za-z]:/#', $dir) !== 1)) {
+            continue;
+        }
+        $candidate = $dir.'/'.$name;
+        if (@is_file($candidate) && @is_executable($candidate)) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * The OS agent's PATH: the folders of the pinned PHP, of `claude` and of
+ * HIVE_LAUNCHER_TOOLS as found here, then HIVE_LAUNCHER_SYSTEM_PATH. Each
+ * once, absolute, and never one with a `:` in it, which would split.
+ *
+ * @return list<string>
+ */
+function hive_launcher_path_dirs(): array
+{
+    $found = [hive_setup_php(), hive_launcher_claude()];
+    foreach (HIVE_LAUNCHER_TOOLS as $tool) {
+        $found[] = hive_launcher_tool($tool);
+    }
+
+    $dirs = [];
+    foreach ($found as $path) {
+        if (is_string($path) && $path !== '' && $path[0] === '/') {
+            $dirs[] = dirname($path);
+        }
+    }
+
+    $out = [];
+    foreach (array_merge($dirs, HIVE_LAUNCHER_SYSTEM_PATH) as $dir) {
+        if ($dir !== '' && $dir[0] === '/' && ! str_contains($dir, ':') && ! in_array($dir, $out, true)) {
+            $out[] = $dir;
+        }
+    }
+
+    return $out;
+}
+
+/** A string as a plist's <string> holds it. */
+function hive_launcher_xml(string $value): string
+{
+    return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+/**
+ * The OS agent's environment as this session would write it: an explicit
+ * PATH (hive_launcher_path_dirs()), then HIVE_LAUNCHER_ENV's values when
+ * set.
+ *
+ * @return array<string, string>
+ */
+function hive_launcher_env(): array
+{
+    $env = ['PATH' => implode(':', hive_launcher_path_dirs())];
+    foreach (HIVE_LAUNCHER_ENV as $name) {
+        $value = getenv($name);
+        if (is_string($value) && trim($value) !== '') {
+            $env[$name] = $value;
+        }
+    }
+
+    return $env;
+}
+
+/** The LaunchAgent this session would write (hive_launcher_plist_for()). */
+function hive_launcher_plist(): string
+{
+    return hive_launcher_plist_for(hive_setup_php(), hive_launcher_env());
+}
+
+/**
+ * The LaunchAgent, byte for byte: $php running the loader's `launcher
+ * tick` every HIVE_LAUNCHER_INTERVAL seconds and once at load, as a
+ * background process, its output to /dev/null, with $env
+ * (hive_launcher_env()). Never a token: the tick reads it from
+ * <home>/.env.hive, as hooks do.
+ *
+ * @param  array<string, string>  $env
+ */
+function hive_launcher_plist_for(string $php, array $env): string
+{
+    $args = '';
+    foreach ([$php, hive_stable_client_path(), 'launcher', 'tick'] as $arg) {
+        $args .= "\t\t<string>".hive_launcher_xml($arg)."</string>\n";
+    }
+    $vars = '';
+    foreach ($env as $name => $value) {
+        $vars .= "\t\t<key>".$name."</key>\n\t\t<string>".hive_launcher_xml($value)."</string>\n";
+    }
+
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        ."<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        ."<plist version=\"1.0\">\n"
+        ."<dict>\n"
+        ."\t<key>Label</key>\n\t<string>".hive_launcher_xml(hive_launcher_label())."</string>\n"
+        ."\t<key>ProgramArguments</key>\n\t<array>\n".$args."\t</array>\n"
+        ."\t<key>EnvironmentVariables</key>\n\t<dict>\n".$vars."\t</dict>\n"
+        ."\t<key>StartInterval</key>\n\t<integer>".HIVE_LAUNCHER_INTERVAL."</integer>\n"
+        ."\t<key>RunAtLoad</key>\n\t<true/>\n"
+        ."\t<key>ProcessType</key>\n\t<string>Background</string>\n"
+        ."\t<key>StandardOutPath</key>\n\t<string>/dev/null</string>\n"
+        ."\t<key>StandardErrorPath</key>\n\t<string>/dev/null</string>\n"
+        ."</dict>\n"
+        ."</plist>\n";
+}
+
+/**
+ * A LaunchAgent this client wrote, read back: the PHP its ProgramArguments
+ * start and its EnvironmentVariables. Null for a file in any other shape.
+ *
+ * @return array{php: string, env: array<string, string>}|null
+ */
+function hive_launcher_plist_read(string $bytes): ?array
+{
+    if (preg_match('#\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>([^<]*)</string>\n#', $bytes, $php) !== 1
+        || preg_match('#\t<key>EnvironmentVariables</key>\n\t<dict>\n((?:\t\t<key>[A-Za-z_][A-Za-z0-9_]*</key>\n\t\t<string>[^<]*</string>\n)*)\t</dict>\n#',
+            $bytes, $block) !== 1) {
+        return null;
+    }
+    preg_match_all('#\t\t<key>([A-Za-z_][A-Za-z0-9_]*)</key>\n\t\t<string>([^<]*)</string>\n#', $block[1], $pairs, PREG_SET_ORDER);
+    $env = [];
+    foreach ($pairs as $pair) {
+        $env[$pair[1]] = html_entity_decode($pair[2], ENT_XML1 | ENT_QUOTES, 'UTF-8');
+    }
+
+    return ['php' => html_entity_decode($php[1], ENT_XML1 | ENT_QUOTES, 'UTF-8'), 'env' => $env];
+}
+
+/**
+ * Whether the OS agent's PATH ($path, as its plist holds it) still finds
+ * what a tick needs: a `php` in one of its folders, and a `claude` where a
+ * launch looks for one (hive_launcher_claude()).
+ */
+function hive_launcher_path_finds(string $path): bool
+{
+    $php = false;
+    foreach (explode(':', $path) as $dir) {
+        if ($dir !== '' && $dir[0] === '/' && @is_file($dir.'/php') && @is_executable($dir.'/php')) {
+            $php = true;
+            break;
+        }
+    }
+
+    return $php && hive_launcher_claude($path) !== null;
+}
+
+/** Whether $php is the interpreter this client pins, by that spelling or another (realpath). */
+function hive_launcher_same_php(string $php): bool
+{
+    if ($php === hive_setup_php()) {
+        return true;
+    }
+    $real = @realpath($php);
+    $self = PHP_BINARY !== '' ? @realpath(PHP_BINARY) : false;
+
+    return $real !== false && $self !== false && $real === $self && @is_executable($php);
+}
+
+/** A path as Windows writes it. */
+function hive_launcher_windows_path(string $path): string
+{
+    return str_replace('/', '\\', $path);
+}
+
+/** The Scheduled Task's command: php-win.exe running the loader's `launcher tick`, each path in double quotes. */
+function hive_launcher_task_command(string $phpw, string $loader): string
+{
+    return hive_launcher_task_program($phpw).' '.hive_launcher_task_arguments($loader);
+}
+
+/** The task's program: php-win.exe, in double quotes, as Windows writes the path. */
+function hive_launcher_task_program(string $phpw): string
+{
+    return '"'.hive_launcher_windows_path($phpw).'"';
+}
+
+/** The task's arguments: the loader, in double quotes, then `launcher tick`. */
+function hive_launcher_task_arguments(string $loader): string
+{
+    return '"'.hive_launcher_windows_path($loader).'" launcher tick';
+}
+
+/**
+ * The Scheduled Task as Task Scheduler's own XML (schema 1.2, Windows 7
+ * and later), before it is encoded (hive_launcher_task_file()):
+ *
+ *   a time trigger from HIVE_LAUNCHER_TASK_START repeating every minute,
+ *   for ever: the cadence `/SC MINUTE /MO 1` gave, running from the moment
+ *   it is created (a logon trigger would wait for the next logon)
+ *   InteractiveToken, least privilege: as the user who created it, only
+ *   while they are logged on, in their session; no password is stored
+ *   on battery too, and not stopped when unplugged: Task Scheduler's
+ *   defaults (/Create without /XML) keep a laptop on battery from ever
+ *   starting it
+ *   one tick at a time (IgnoreNew), each stopped after two minutes
+ *   (a tick ends within about 90 seconds)
+ *   php-win.exe running the loader's `launcher tick`, the same command
+ *   /TR gave (hive_launcher_task_command())
+ *
+ * CRLF, as Task Scheduler writes its own. Nothing of the token.
+ */
+function hive_launcher_task_xml(string $phpw, string $loader): string
+{
+    $lines = [
+        '<?xml version="1.0" encoding="UTF-16"?>',
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+        '  <RegistrationInfo>',
+        '    <Description>Velu Hive launcher: opens a new Claude session for a board approval when none is running here.</Description>',
+        '  </RegistrationInfo>',
+        '  <Triggers>',
+        '    <TimeTrigger>',
+        '      <Repetition>',
+        '        <Interval>PT1M</Interval>',
+        '        <StopAtDurationEnd>false</StopAtDurationEnd>',
+        '      </Repetition>',
+        '      <StartBoundary>'.HIVE_LAUNCHER_TASK_START.'</StartBoundary>',
+        '      <Enabled>true</Enabled>',
+        '    </TimeTrigger>',
+        '  </Triggers>',
+        '  <Principals>',
+        '    <Principal id="Author">',
+        '      <LogonType>InteractiveToken</LogonType>',
+        '      <RunLevel>LeastPrivilege</RunLevel>',
+        '    </Principal>',
+        '  </Principals>',
+        '  <Settings>',
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+        '    <AllowHardTerminate>true</AllowHardTerminate>',
+        '    <StartWhenAvailable>false</StartWhenAvailable>',
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+        '    <Enabled>true</Enabled>',
+        '    <Hidden>false</Hidden>',
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+        '    <WakeToRun>false</WakeToRun>',
+        '    <ExecutionTimeLimit>'.HIVE_LAUNCHER_TASK_LIMIT.'</ExecutionTimeLimit>',
+        '    <Priority>7</Priority>',
+        '  </Settings>',
+        '  <Actions Context="Author">',
+        '    <Exec>',
+        '      <Command>'.hive_launcher_xml(hive_launcher_task_program($phpw)).'</Command>',
+        '      <Arguments>'.hive_launcher_xml(hive_launcher_task_arguments($loader)).'</Arguments>',
+        '    </Exec>',
+        '  </Actions>',
+        '</Task>',
+    ];
+
+    return implode("\r\n", $lines)."\r\n";
+}
+
+/**
+ * The task's XML as the file `schtasks /Create /XML` reads: UTF-16 LE with
+ * a byte order mark, the encoding its declaration names, as Task
+ * Scheduler exports every task (`schtasks /Query /XML`) and as schtasks
+ * reads one without fail. Null when a path in it is not UTF-8.
+ */
+function hive_launcher_task_file(string $phpw, string $loader): ?string
+{
+    $utf16 = hive_utf16le_encode(hive_launcher_task_xml($phpw, $loader));
+
+    return $utf16 === null ? null : "\xFF\xFE".$utf16;
+}
+
+/** <home>/launcher-task.xml: the task's XML, there only while schtasks reads it. */
+function hive_launcher_task_xml_path(): string
+{
+    return hive_home().'/launcher-task.xml';
+}
+
+/**
+ * schtasks' arguments that create (or replace, /F) the Scheduled Task from
+ * its XML (hive_launcher_task_xml()): as this user, only while they are
+ * logged on (no /RU, no password, so Task Scheduler runs it in their
+ * session).
+ *
+ * @return list<string>
+ */
+function hive_launcher_schtasks_create(string $xmlPath): array
+{
+    return ['schtasks', '/Create', '/TN', HIVE_LAUNCHER_TASK, '/XML', hive_launcher_windows_path($xmlPath), '/F'];
+}
+
+/** @return list<string> schtasks' arguments that delete the Scheduled Task. */
+function hive_launcher_schtasks_delete(): array
+{
+    return ['schtasks', '/Delete', '/TN', HIVE_LAUNCHER_TASK, '/F'];
+}
+
+/** @return list<string> schtasks' arguments that ask whether the Scheduled Task is there (exit 0 when it is). */
+function hive_launcher_schtasks_query(): array
+{
+    return ['schtasks', '/Query', '/TN', HIVE_LAUNCHER_TASK];
+}
+
+/**
+ * The Scheduled Task deleted, whatever launcher.json remembers of it: a
+ * launcher.json lost or rewritten must not leave a task running php-win.exe
+ * every minute. `schtasks /Delete` always; when it fails, `schtasks /Query`
+ * tells "not there" (none, or removed when this client had a record of
+ * one: it is gone either way) from "still there" (failed). A schtasks that
+ * would not start at all is failed only when there was a record.
+ */
+function hive_launcher_schtasks_remove(): string
+{
+    $deleted = hive_launcher_run(hive_launcher_schtasks_delete());
+    if ($deleted === 0) {
+        return 'removed';
+    }
+    $query = $deleted === null ? null : hive_launcher_run(hive_launcher_schtasks_query());
+    if ($query === 0) {
+        return 'failed';
+    }
+    if ($query === null) {
+        return hive_launcher_present() ? 'failed' : 'none';
+    }
+
+    return hive_launcher_present() ? 'removed' : 'none';
+}
+
+/** This user's uid, for launchctl's gui/<uid> domain. */
+function hive_launcher_uid(): int
+{
+    return function_exists('posix_getuid') ? (int) posix_getuid() : (int) getmyuid();
+}
+
+/**
+ * Is the OS agent here: the LaunchAgent's file on macOS; on Windows, the
+ * Scheduled Task this client created and has not deleted since, or that
+ * ran a tick since launcher.json lost it (hive_launcher_tick_locked()).
+ */
+function hive_launcher_present(): bool
+{
+    $os = hive_launcher_os();
+    if ($os === 'Darwin') {
+        return is_file(hive_launcher_plist_path());
+    }
+
+    return $os === 'Windows' && (hive_launcher_state()['agent']['os'] ?? null) === 'Windows';
+}
+
+/**
+ * Whether a session start should try removing the OS agent: when it is
+ * here (hive_launcher_present()), and on Windows also while there is no
+ * launcher.json at all -- lost, so nothing says whether a task is there --
+ * which the removal answers once and writes (hive_launcher_uninstall()).
+ * Only stats: nothing is started here.
+ */
+function hive_launcher_maybe_present(): bool
+{
+    return hive_launcher_present() || (hive_launcher_os() === 'Windows' && ! is_file(hive_launcher_state_path()));
+}
+
+/**
+ * Is the OS agent here what this client would write now. On Windows, the
+ * same task command. On macOS, the same LaunchAgent in every stable part --
+ * its label, ProgramArguments (the same PHP, by any spelling of it, and the
+ * loader), StartInterval and the rest -- whatever this session's PATH and
+ * optional variables are: a terminal, an IDE and an nvm shell each have
+ * their own, and a rewrite unloads the agent (stopping a running tick) and
+ * may show "Background item added" again. Its environment counts only
+ * when its PATH no longer finds php and `claude` while this session's
+ * would (hive_launcher_path_finds()). A plugin update changes nothing (the
+ * agent runs the loader); a moved PHP, or a `claude` its PATH lost, does.
+ */
+function hive_launcher_current(): bool
+{
+    $os = hive_launcher_os();
+    if ($os === 'Darwin') {
+        $bytes = @file_get_contents(hive_launcher_plist_path());
+        $installed = is_string($bytes) ? hive_launcher_plist_read($bytes) : null;
+        if ($installed === null) {
+            return false;
+        }
+        $php = hive_launcher_same_php($installed['php']) ? $installed['php'] : hive_setup_php();
+        if ($bytes !== hive_launcher_plist_for($php, $installed['env'])) {
+            return false;
+        }
+
+        return hive_launcher_path_finds($installed['env']['PATH'] ?? '') || ! hive_launcher_path_finds(hive_launcher_env()['PATH']);
+    }
+    $phpw = hive_launcher_phpw();
+    $agent = hive_launcher_state()['agent'];
+
+    return $os === 'Windows' && $phpw !== null && ($agent['os'] ?? null) === 'Windows'
+        && ($agent['command'] ?? null) === hive_launcher_task_command($phpw, hive_stable_client_path());
+}
+
+// -----------------------------------------------------------------------------
+// What the launcher keeps: <home>/launcher.json
+// -----------------------------------------------------------------------------
+
+/**
+ * <home>/launcher.json, each field in its shape:
+ *
+ *   etag       the ETag of Hive's last 200 or 304, sent as If-None-Match
+ *   polled_at  when the tick last asked
+ *   answer     the last 200: launches (action, act, at, expires_at as
+ *              timestamps), hot, next_at (a timestamp or null)
+ *   off_until  until when no poll goes (a 401, 403 or 404)
+ *   tried      ulid => the outcome of opening it (null while it opens):
+ *              a launch is opened here once, whatever a retake answers
+ *   pending    ulid => {act, at, expires_at}: launches whose take got no
+ *              answer (none, a 429, a 5xx). Hive may have taken one all the
+ *              same, and then never lists it again, so it is taken again
+ *              while its window lasts (hive_launcher_retake_pending())
+ *   outcomes   ulid => {outcome, at}: outcomes Hive has not acknowledged
+ *   reported   {state, at, heard}: the launcher's state as this client
+ *              last told Hive, and whether Hive answered 200
+ *   agent      {os, command}: the Scheduled Task this client created
+ *
+ * @return array{etag: ?string, polled_at: int, answer: ?array{launches: list<array{action: string, act: string, at: int, expires_at: int}>, hot: bool, next_at: ?int}, off_until: int, tried: array<string, ?string>, pending: array<string, array{act: string, at: int, expires_at: int}>, outcomes: array<string, array{outcome: string, at: int}>, reported: ?array{state: string, at: int, heard: bool}, agent: ?array{os: string, command: string}}
+ */
+function hive_launcher_state(): array
+{
+    $raw = hive_read_json(hive_launcher_state_path()) ?? [];
+
+    $etag = hive_str($raw['etag'] ?? null);
+    $answer = is_array($raw['answer'] ?? null) ? hive_launcher_answer_kept($raw['answer']) : null;
+
+    $tried = [];
+    foreach (is_array($raw['tried'] ?? null) ? $raw['tried'] : [] as $ulid => $outcome) {
+        if (is_string($ulid) && hive_is_ulid($ulid)) {
+            $tried[$ulid] = is_string($outcome) && in_array($outcome, HIVE_LAUNCH_OUTCOMES, true) ? $outcome : null;
+        }
+    }
+    $pending = [];
+    foreach (is_array($raw['pending'] ?? null) ? $raw['pending'] : [] as $ulid => $entry) {
+        if (is_string($ulid) && hive_is_ulid($ulid) && is_array($entry) && in_array($entry['act'] ?? null, HIVE_BOARD_ACTS, true)
+            && is_int($entry['at'] ?? null) && is_int($entry['expires_at'] ?? null)) {
+            $pending[$ulid] = ['act' => (string) $entry['act'], 'at' => (int) $entry['at'], 'expires_at' => (int) $entry['expires_at']];
+        }
+    }
+    $outcomes = [];
+    foreach (is_array($raw['outcomes'] ?? null) ? $raw['outcomes'] : [] as $ulid => $entry) {
+        if (is_string($ulid) && hive_is_ulid($ulid) && is_array($entry) && in_array($entry['outcome'] ?? null, HIVE_LAUNCH_OUTCOMES, true)
+            && is_int($entry['at'] ?? null)) {
+            $outcomes[$ulid] = ['outcome' => (string) $entry['outcome'], 'at' => (int) $entry['at']];
+        }
+    }
+    $reported = is_array($raw['reported'] ?? null) && in_array($raw['reported']['state'] ?? null, HIVE_LAUNCHER_STATES, true)
+        && is_int($raw['reported']['at'] ?? null)
+        ? ['state' => (string) $raw['reported']['state'], 'at' => (int) $raw['reported']['at'], 'heard' => ($raw['reported']['heard'] ?? false) === true] : null;
+    $agent = is_array($raw['agent'] ?? null) && is_string($raw['agent']['os'] ?? null) && is_string($raw['agent']['command'] ?? null)
+        ? ['os' => $raw['agent']['os'], 'command' => $raw['agent']['command']] : null;
+
+    return [
+        'etag' => $etag !== null && strlen($etag) <= 200 && preg_match('/^[\x21-\x7E]+$/', $etag) === 1 ? $etag : null,
+        'polled_at' => is_int($raw['polled_at'] ?? null) ? $raw['polled_at'] : 0,
+        'answer' => $answer,
+        'off_until' => is_int($raw['off_until'] ?? null) ? $raw['off_until'] : 0,
+        'tried' => $tried,
+        'pending' => $pending,
+        'outcomes' => $outcomes,
+        'reported' => $reported,
+        'agent' => $agent,
+    ];
+}
+
+/**
+ * Read launcher.json, let $change alter it, and write it back under its
+ * lock (launcher.json.lock), so a tick and an install never write over
+ * each other. What it keeps of tried launches and outcomes is pruned to
+ * HIVE_LAUNCHER_KEEP, and a pending launch goes once it expires.
+ *
+ * @param  callable(array<string, mixed>): array<string, mixed>  $change
+ * @return array<string, mixed>
+ */
+function hive_launcher_state_mutate(callable $change): array
+{
+    if (! hive_ensure_home()) {
+        return hive_launcher_state();
+    }
+    $path = hive_launcher_state_path();
+    $lock = @fopen($path.'.lock', 'c');
+    if (is_resource($lock)) {
+        @flock($lock, LOCK_EX);
+    }
+
+    try {
+        $state = $change(hive_launcher_state());
+        $now = time();
+        $state['outcomes'] = array_filter($state['outcomes'], static fn (array $entry): bool => $now - $entry['at'] < HIVE_LAUNCHER_KEEP);
+        $state['tried'] = array_slice($state['tried'], -50, null, true);
+        $state['pending'] = array_slice(array_filter($state['pending'] ?? [], static fn (array $entry): bool => $entry['expires_at'] > $now), -20, null, true);
+        hive_write_json($path, $state);
+
+        return $state;
+    } finally {
+        if (is_resource($lock)) {
+            @flock($lock, LOCK_UN);
+            @fclose($lock);
+        }
+    }
+}
+
+/**
+ * A poll's answer as launcher.json keeps it: for each launch only what the
+ * tick decides by -- its ulid, its act, when it was approved and when it
+ * expires, as timestamps -- never its fields: what a session is opened
+ * with comes from take's own answer. Null for one in no shape.
+ *
+ * @param  array<mixed>  $raw
+ * @return array{launches: list<array{action: string, act: string, at: int, expires_at: int}>, hot: bool, next_at: ?int}|null
+ */
+function hive_launcher_answer_kept(array $raw): ?array
+{
+    if (! is_array($raw['launches'] ?? null) || ! is_bool($raw['hot'] ?? null)) {
+        return null;
+    }
+
+    $launches = [];
+    foreach (array_slice(array_values($raw['launches']), 0, 20) as $entry) {
+        $ulid = is_array($entry) ? ($entry['action'] ?? null) : null;
+        $at = is_array($entry) ? hive_launcher_time($entry['at'] ?? null) : null;
+        $expires = is_array($entry) ? hive_launcher_time($entry['expires_at'] ?? null) : null;
+        if (! is_string($ulid) || ! hive_is_ulid($ulid) || ! in_array($entry['act'] ?? null, HIVE_BOARD_ACTS, true) || $at === null || $expires === null) {
+            continue;
+        }
+        $launches[] = ['action' => $ulid, 'act' => (string) $entry['act'], 'at' => $at, 'expires_at' => $expires];
+    }
+    $next = $raw['next_at'] ?? null;
+
+    return ['launches' => $launches, 'hot' => $raw['hot'], 'next_at' => hive_launcher_time($next)];
+}
+
+/** An ISO 8601 time as Hive writes one, or a timestamp launcher.json kept, as a timestamp; else null. */
+function hive_launcher_time($value): ?int
+{
+    if (is_int($value)) {
+        return $value > 0 ? $value : null;
+    }
+    if (! is_string($value) || preg_match('/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\z/', $value) !== 1) {
+        return null;
+    }
+    $time = strtotime($value);
+
+    return is_int($time) && $time > 0 ? $time : null;
+}
+
+// -----------------------------------------------------------------------------
+// Running what the launcher starts
+// -----------------------------------------------------------------------------
+
+/**
+ * Start $argv -- launchctl, schtasks or an opener -- as an argv array
+ * through proc_open, never a shell string, with its stdio on the null
+ * device, and wait up to $timeoutMs for its exit code. Null when it could
+ * not start or did not end in time (then it is stopped).
+ *
+ * HIVE_LAUNCHER_RUNNER (test-only: the real environment alone, with
+ * HIVE_LAUNCHER_TESTING=1) starts [runner, ...$argv] instead. Without it, launchctl is never started
+ * under the shared label for a HOME that is not this account's own: a
+ * test or a rehearsal with a scratch HOME must not touch the developer's
+ * real launcher (hive_launcher_may_run()).
+ *
+ * @param  list<string>  $argv
+ */
+function hive_launcher_run(array $argv, int $timeoutMs = HIVE_LAUNCHER_RUN_MS): ?int
+{
+    if (! function_exists('proc_open') || $argv === []) {
+        return null;
+    }
+    $runner = hive_launcher_testing() ? getenv('HIVE_LAUNCHER_RUNNER') : false;
+    if (is_string($runner) && $runner !== '') {
+        if (! is_file($runner)) {
+            return null;
+        }
+        $argv = array_merge([$runner], $argv);
+    } elseif (! hive_launcher_may_run($argv[0])) {
+        return null;
+    }
+
+    $windows = PHP_OS_FAMILY === 'Windows';
+    $null = $windows ? 'NUL' : '/dev/null';
+    $io = [0 => ['file', $null, 'r'], 1 => ['file', $null, 'w'], 2 => ['file', $null, 'w']];
+    $process = @proc_open(array_map('strval', $argv), $io, $pipes, null, null, $windows ? ['bypass_shell' => true] : []);
+    if (! is_resource($process)) {
+        return null;
+    }
+
+    $deadline = microtime(true) + ($timeoutMs / 1000);
+    $code = null;
+    while (true) {
+        $status = @proc_get_status($process);
+        if (! is_array($status)) {
+            break;
+        }
+        if (! $status['running']) {
+            $code = (int) $status['exitcode'];
+            break;
+        }
+        if (microtime(true) >= $deadline) {
+            hive_process_kill($process, (int) $status['pid']);
+            @proc_close($process);
+
+            return null;
+        }
+        usleep(10_000);
+    }
+    $closed = @proc_close($process);
+
+    return $code ?? ($closed !== -1 ? $closed : null);
+}
+
+/**
+ * Whether $program may really be started here: launchctl under the shared
+ * label only for this account's own home (posix_getpwuid()), so a scratch
+ * HOME never boots out the developer's real launcher; schtasks never for a
+ * Hive home inside the system's temp folder, which is a test's (the task's
+ * name is the same for every Hive home, and uninstall deletes it whatever
+ * launcher.json says). Everything else may.
+ */
+function hive_launcher_may_run(string $program): bool
+{
+    if (strtolower(basename(hive_normalise_slashes($program))) === 'schtasks') {
+        $temp = rtrim(hive_normalise_slashes(sys_get_temp_dir()), '/').'/';
+
+        return $temp === '/' || stripos(rtrim(hive_normalise_slashes(hive_home()), '/').'/', $temp) !== 0;
+    }
+    if (basename($program) !== 'launchctl' || hive_launcher_label() !== HIVE_LAUNCHER_LABEL || ! function_exists('posix_getpwuid')) {
+        return true;
+    }
+    $account = @posix_getpwuid(hive_launcher_uid());
+    $own = is_array($account) && is_string($account['dir'] ?? null) ? rtrim(hive_normalise_slashes($account['dir']), '/') : null;
+
+    return $own === null || $own === rtrim(hive_user_home(), '/');
+}
+
+// -----------------------------------------------------------------------------
+// Telling Hive
+// -----------------------------------------------------------------------------
+
+/**
+ * PUT /progress/launcher (docs/api/board-actions.md, "The launcher's
+ * state"): what install or uninstall did, kept in launcher.json with
+ * whether Hive answered 200, so the tick says an `installed` Hive did not
+ * hear again (hive_launcher_tick_locked()). Whether Hive answered 200.
+ */
+function hive_launcher_report(string $state, float $seconds = 5.0): bool
+{
+    if (! in_array($state, HIVE_LAUNCHER_STATES, true) || hive_progress_blocked() !== null) {
+        return false;
+    }
+    $result = hive_http('PUT', '/progress/launcher', ['state' => $state], 'progress', [], microtime(true) + $seconds);
+    $json = is_array($result['json'] ?? null) ? $result['json'] : [];
+    $heard = (int) $result['status'] === 200 && ($json['state'] ?? null) === $state;
+
+    hive_launcher_state_mutate(static function (array $doc) use ($state, $heard): array {
+        $doc['reported'] = ['state' => $state, 'at' => time(), 'heard' => $heard];
+
+        return $doc;
+    });
+
+    return $heard;
+}
+
+/**
+ * POST /progress/board-actions/{action}/outcome: what opening a taken
+ * launch came to. Kept in launcher.json first, and said again at later
+ * ticks while Hive gives no answer (none, a 429, a 5xx), for up to
+ * HIVE_LAUNCHER_KEEP. Any other answer settles it: 200, or a refusal
+ * (404, 409 outcome_reported, 410 action_gone) that says Hive has it, or
+ * never will. Whether it is settled.
+ */
+function hive_launcher_outcome(string $ulid, string $outcome): bool
+{
+    if (! hive_is_ulid($ulid) || ! in_array($outcome, HIVE_LAUNCH_OUTCOMES, true)) {
+        return true;
+    }
+    hive_launcher_state_mutate(static function (array $doc) use ($ulid, $outcome): array {
+        $doc['outcomes'][$ulid] = ['outcome' => $outcome, 'at' => $doc['outcomes'][$ulid]['at'] ?? time()];
+        $doc['tried'][$ulid] = $outcome;
+
+        return $doc;
+    });
+
+    $result = hive_http('POST', '/progress/board-actions/'.$ulid.'/outcome', ['outcome' => $outcome], 'progress', [], microtime(true) + 5.0);
+    $status = (int) $result['status'];
+    $settled = $status !== 0 && $status !== 429 && $status < 500;
+    if ($settled) {
+        hive_launcher_state_mutate(static function (array $doc) use ($ulid): array {
+            unset($doc['outcomes'][$ulid]);
+
+            return $doc;
+        });
+    }
+
+    return $settled;
+}
+
+/** The outcomes Hive has not acknowledged yet, said again, oldest first. */
+function hive_launcher_outcomes_again(): void
+{
+    foreach (hive_launcher_state()['outcomes'] as $ulid => $entry) {
+        if (! hive_launcher_outcome((string) $ulid, $entry['outcome'])) {
+            return;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// VERB: launcher install | uninstall | status | tick
+// -----------------------------------------------------------------------------
+
+/**
+ * `launcher install|uninstall|status|tick`. A session start runs install and
+ * uninstall (hive_launcher_upkeep(), detached); the OS agent runs tick.
+ *
+ * @param  list<string>  $args
+ */
+function hive_verb_launcher(array $args): int
+{
+    switch ($args[0] ?? 'status') {
+        case 'install':   return hive_launcher_install(true);
+        case 'uninstall': return hive_launcher_uninstall(true) === 'failed' ? 1 : 0;
+        case 'status':    return hive_launcher_status();
+        case 'tick':      return hive_launcher_tick();
+        default:
+            fwrite(STDERR, 'Usage: '.hive_self_command().' launcher install|uninstall|status|tick'."\n");
+
+            return 1;
+    }
+}
+
+/**
+ * `launcher install`: write the OS agent and load it, then tell Hive
+ * (PUT /progress/launcher): `installed`, `failed`, or `unsupported` on a
+ * computer that cannot run it. Only while the cached policy says
+ * board.launch true -- the developer switched it on for this computer,
+ * with an authenticator code -- and Hive is on here with a token, and
+ * HIVE_BOARD_LAUNCH is not 0. $say false (an inline upkeep, inside a hook)
+ * prints nothing. 0 once installed.
+ */
+function hive_launcher_install(bool $say): int
+{
+    $line = static function (string $text) use ($say): void {
+        if ($say) {
+            hive_line($text);
+        }
+    };
+    $refuse = static function (string $text) use ($say): int {
+        if ($say) {
+            fwrite(STDERR, $text."\n");
+        }
+
+        return 1;
+    };
+
+    if (hive_is_disabled()) {
+        return $refuse('Hive is off on this computer, so its launcher is not installed.');
+    }
+    if (! hive_launcher_on()) {
+        return $refuse('HIVE_BOARD_LAUNCH=0 keeps Hive\'s launcher off on this computer.');
+    }
+    if (hive_progress_blocked() !== null) {
+        return $refuse('Hive\'s launcher is not installed: '.hive_progress_blocked().'.');
+    }
+    if (hive_launcher_policy(hive_policy_cache_any())['launch'] !== true) {
+        return $refuse('Hive\'s launcher is installed once "Open a new session on this computer" is on for this computer '
+            .'(on Hive\'s board, My access > My machines) and a session start here has heard so.');
+    }
+
+    $unsupported = hive_launcher_unsupported();
+    if ($unsupported !== null) {
+        hive_launcher_report('unsupported');
+
+        return $refuse('Hive\'s launcher cannot run on this computer ('.$unsupported.'); approvals reach a session here only while one runs.');
+    }
+
+    if (hive_launcher_os() === 'Darwin') {
+        $plist = hive_launcher_plist_path();
+        $dir = dirname($plist);
+        $label = hive_launcher_label();
+        $domain = 'gui/'.hive_launcher_uid();
+        $written = (is_dir($dir) || @mkdir($dir, 0755, true)) && @file_put_contents($plist, hive_launcher_plist()) !== false;
+        if ($written) {
+            @chmod($plist, 0644);
+            hive_launcher_run(['/bin/launchctl', 'bootout', $domain.'/'.$label]);
+            // A bootout may still be settling: one more try a second later.
+            $loaded = hive_launcher_run(['/bin/launchctl', 'bootstrap', $domain, $plist]) === 0;
+            if (! $loaded) {
+                hive_launcher_sleep(1.0);
+                $loaded = hive_launcher_run(['/bin/launchctl', 'bootstrap', $domain, $plist]) === 0;
+            }
+        }
+        if (! $written || ! $loaded) {
+            // Gone, so the next session start tries again.
+            @unlink($plist);
+            hive_launcher_report('failed');
+
+            return $refuse('Hive\'s launcher could not be '.($written ? 'loaded (launchctl bootstrap '.$domain.' failed)' : 'written to '.$plist).'.');
+        }
+        hive_launcher_report('installed');
+        $line('Hive\'s launcher is installed: '.$plist.', every '.HIVE_LAUNCHER_INTERVAL.' s.');
+
+        return 0;
+    }
+
+    $phpw = (string) hive_launcher_phpw();
+    $command = hive_launcher_task_command($phpw, hive_stable_client_path());
+    $xml = hive_launcher_task_file($phpw, hive_stable_client_path());
+    $xmlPath = hive_launcher_task_xml_path();
+    $created = $xml !== null && hive_launch_write($xmlPath, $xml, 0600) && hive_launcher_run(hive_launcher_schtasks_create($xmlPath)) === 0;
+    @unlink($xmlPath);
+    if (! $created) {
+        hive_launcher_report('failed');
+
+        return $refuse('Hive\'s launcher could not be installed: schtasks /Create /XML failed.');
+    }
+    hive_launcher_state_mutate(static function (array $doc) use ($command): array {
+        $doc['agent'] = ['os' => 'Windows', 'command' => $command];
+
+        return $doc;
+    });
+    hive_launcher_report('installed');
+    $line('Hive\'s launcher is installed: the Scheduled Task '.HIVE_LAUNCHER_TASK.', every minute while you are logged on.');
+
+    return 0;
+}
+
+/**
+ * `launcher uninstall`: remove the OS agent, forget what the tick kept, and
+ * tell Hive `removed`. On macOS only when the LaunchAgent's file is there:
+ * the file is deleted first and Hive told, and the agent booted out last,
+ * since a tick that removes its own agent ends with that bootout. On
+ * Windows always `schtasks /Delete`, whatever launcher.json remembers
+ * (hive_launcher_schtasks_remove()); when schtasks finds none, launcher.json
+ * is written so a session start does not look again. Nothing is sent when
+ * there was none. What it came to: removed, none or failed.
+ */
+function hive_launcher_uninstall(bool $say): string
+{
+    $line = static function (string $text) use ($say): void {
+        if ($say) {
+            hive_line($text);
+        }
+    };
+    $forget = static function (array $doc): array {
+        $doc['agent'] = null;
+        $doc['etag'] = null;
+        $doc['answer'] = null;
+        $doc['pending'] = [];
+
+        return $doc;
+    };
+    $os = hive_launcher_os();
+
+    if ($os === 'Darwin' && hive_launcher_present()) {
+        $plist = hive_launcher_plist_path();
+        if (! @unlink($plist) && is_file($plist)) {
+            $line('Hive\'s launcher could not be removed: '.$plist.' is still there.');
+
+            return 'failed';
+        }
+        hive_launcher_state_mutate($forget);
+        hive_launcher_report('removed');
+        $line('Hive\'s launcher is removed: '.$plist.'.');
+        hive_launcher_run(['/bin/launchctl', 'bootout', 'gui/'.hive_launcher_uid().'/'.hive_launcher_label()]);
+
+        return 'removed';
+    }
+
+    if ($os === 'Windows') {
+        $gone = hive_launcher_schtasks_remove();
+        if ($gone === 'failed') {
+            $line('Hive\'s launcher could not be removed: the Scheduled Task '.HIVE_LAUNCHER_TASK.' is still there (schtasks /Delete /TN "'
+                .HIVE_LAUNCHER_TASK.'" /F removes it).');
+
+            return 'failed';
+        }
+        hive_launcher_state_mutate($forget);
+        if ($gone === 'removed') {
+            hive_launcher_report('removed');
+            $line('Hive\'s launcher is removed: the Scheduled Task '.HIVE_LAUNCHER_TASK.'.');
+
+            return 'removed';
+        }
+    }
+
+    $line('Hive\'s launcher is not installed on this computer.');
+
+    return 'none';
+}
+
+/** `launcher status`: where it stands on this computer, one line each. */
+function hive_launcher_status(): int
+{
+    $state = hive_launcher_state();
+    $policy = hive_launcher_policy(hive_policy_cache_any());
+    $unsupported = hive_launcher_unsupported();
+    $present = hive_launcher_present();
+    $row = static function (string $label, string $text): void {
+        hive_line('  '.str_pad($label, 11).hive_one_line($text));
+    };
+
+    hive_line('Hive\'s launcher: a new Claude session for a board approval when none is live here');
+    $row('computer', hive_launcher_os_name().($unsupported !== null ? ' -- cannot run it ('.$unsupported.')' : ''));
+    $row('switch', $policy['launch'] === null ? 'not served yet (no session start here has heard it)'
+        : ($policy['launch'] ? 'on for this computer' : 'off for this computer'));
+    if (! hive_launcher_on()) {
+        $row('here', 'HIVE_BOARD_LAUNCH=0: kept off on this computer');
+    }
+    $row('agent', $present
+        ? (hive_launcher_os() === 'Darwin' ? hive_launcher_plist_path() : 'the Scheduled Task '.HIVE_LAUNCHER_TASK)
+            .(hive_launcher_current() ? '' : ' -- differs from what Hive would write now; the next session start rewrites it')
+        : 'not installed');
+    $row('on Hive', $state['reported'] === null ? 'not told yet' : $state['reported']['state']
+        .($state['reported']['heard'] ? ', told '.hive_ago(time() - $state['reported']['at']).' ago' : ', not heard by Hive yet'));
+    $row('last poll', $state['polled_at'] > 0 ? hive_ago(time() - $state['polled_at']).' ago' : 'never');
+    if ($state['off_until'] > time()) {
+        $row('held', 'Hive refused its polls; it asks again in '.hive_ago($state['off_until'] - time()));
+    }
+    if ($state['outcomes'] !== []) {
+        $row('to say', count($state['outcomes']).' outcome'.(count($state['outcomes']) === 1 ? '' : 's').' Hive has not heard yet');
+    }
+
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// The tick
+// -----------------------------------------------------------------------------
+
+/**
+ * The hot pace, [every, until] seconds: 5 and 55, or HIVE_LAUNCHER_PACE's
+ * `<every>:<until>` (test-only: the real environment alone, with
+ * HIVE_LAUNCHER_TESTING=1), until at most 55.
+ *
+ * @return array{0: int, 1: int}
+ */
+function hive_launcher_pace(): array
+{
+    $pace = hive_launcher_testing() ? getenv('HIVE_LAUNCHER_PACE') : false;
+    if (is_string($pace) && preg_match('/\A(\d{1,2}):(\d{1,2})\z/', $pace, $m) === 1 && (int) $m[1] >= 1 && (int) $m[2] <= HIVE_LAUNCHER_HOT_UNTIL) {
+        return [(int) $m[1], (int) $m[2]];
+    }
+
+    return [HIVE_LAUNCHER_HOT_EVERY, HIVE_LAUNCHER_HOT_UNTIL];
+}
+
+/**
+ * `launcher tick`, which the OS agent runs every minute, and which says
+ * nothing: one at a time (an flock on <home>/launcher.lock), and nothing
+ * at all while Hive is off here, has no token or no https address, while
+ * HIVE_BOARD_LAUNCH=0, in a headless run, or on a computer that cannot open
+ * a session. Then:
+ *
+ *   0. the agent removes itself when the cached policy says board.launch
+ *      false (hive_launcher_uninstall(), which tells Hive `removed`)
+ *   1. outcomes Hive has not heard are said again; and `installed` while
+ *      the agent is here and Hive was told otherwise, or did not hear it an
+ *      hour ago
+ *   2. it polls (hive_launcher_poll()) when board.poll_seconds have passed
+ *      since the last poll, or the last answer was hot or named a next_at
+ *      now due; never while a 401, 403 or 404 holds it (an hour)
+ *   3. it takes and opens the first launch whose expires_at is still ahead
+ *      by this computer's clock (hive_launcher_launch()), at most one a tick.
+ *      A take with no answer is kept (launcher.json `pending`) and taken
+ *      again once more that tick and then at each tick, before it polls,
+ *      while its window lasts: Hive answers a retake within retake_seconds
+ *      as the take, and a 404, 409 or 410 drops it
+ *   4. while the answer says hot, it polls again every 5 s until 55 s into
+ *      the tick; when next_at falls within the tick, again then. A 429, a
+ *      503 or no answer waits for the next tick; so does a 409 not_now
+ */
+function hive_launcher_tick(): int
+{
+    try {
+        if (hive_is_disabled() || ! hive_launcher_on() || hive_is_headless() || hive_progress_blocked() !== null
+            || ! in_array(hive_launcher_os(), ['Darwin', 'Windows'], true) || ! hive_ensure_home()) {
+            return 0;
+        }
+
+        $lock = @fopen(hive_home().'/launcher.lock', 'c');
+        if (! is_resource($lock) || ! @flock($lock, LOCK_EX | LOCK_NB)) {
+            if (is_resource($lock)) {
+                @fclose($lock);
+            }
+
+            return 0;
+        }
+
+        try {
+            hive_launcher_tick_locked();
+        } finally {
+            @flock($lock, LOCK_UN);
+            @fclose($lock);
+        }
+    } catch (Throwable $e) {
+        // Said nowhere: the OS agent's output goes to the null device.
+    }
+
+    return 0;
+}
+
+/** The tick's work, under its lock (hive_launcher_tick()). */
+function hive_launcher_tick_locked(): void
+{
+    $started = microtime(true);
+    [$every, $until] = hive_launcher_pace();
+
+    hive_launcher_sweep_files();
+    // On Windows the Scheduled Task is what runs a tick: one launcher.json
+    // lost or rewritten is recorded again, with no command (so a session
+    // start that wants it rewrites it, and one that does not removes it).
+    if (hive_launcher_os() === 'Windows' && ! hive_launcher_present()) {
+        hive_launcher_state_mutate(static function (array $doc): array {
+            $doc['agent'] = ['os' => 'Windows', 'command' => ''];
+
+            return $doc;
+        });
+    }
+    // Switched off for this computer, as the policy a hook cached since says
+    // (a running session's heartbeat brings it): the agent removes itself,
+    // on an explicit false only, as the upkeep does. On macOS only the agent
+    // launchd started under this label, never a tick run by hand or a
+    // rehearsal's agent: launchd names its job in XPC_SERVICE_NAME.
+    if (hive_launcher_policy(hive_policy_cache_any())['launch'] === false && hive_launcher_present()
+        && (hive_launcher_os() !== 'Darwin' || getenv('XPC_SERVICE_NAME') === hive_launcher_label())) {
+        hive_launcher_uninstall(false);
+
+        return;
+    }
+    hive_launcher_outcomes_again();
+    $state = hive_launcher_state();
+    $reported = $state['reported'];
+    if (hive_launcher_present() && ($reported === null || $reported['state'] !== 'installed'
+        || (! $reported['heard'] && time() - $reported['at'] >= HIVE_LAUNCHER_KEEP))) {
+        hive_launcher_report('installed');
+    }
+
+    $now = time();
+    if ($state['off_until'] > $now) {
+        return;
+    }
+    // A take whose answer was lost, taken again before anything else: the
+    // tick's one launch, whenever the poll is due.
+    $retook = hive_launcher_retake_pending();
+    if ($retook !== 'none' && $retook !== 'refused') {
+        return;
+    }
+    $poll = hive_launcher_policy(hive_policy_cache_any())['poll_seconds'];
+    $answer = $state['answer'];
+    $due = $now - $state['polled_at'] >= $poll - HIVE_LAUNCHER_POLL_SLACK
+        || ($answer !== null && $answer['hot'] && $now - $state['polled_at'] < 2 * HIVE_LAUNCHER_INTERVAL)
+        || ($answer !== null && $answer['next_at'] !== null && $answer['next_at'] <= $now);
+    if (! $due) {
+        return;
+    }
+
+    // Launches Hive refused to give this tick: the poll may list them again
+    // until its answer moves, and they are not asked for twice.
+    $refused = [];
+    $polls = 0;
+    while (true) {
+        $answer = hive_launcher_poll();
+        if ($answer === null) {
+            return;
+        }
+
+        $took = hive_launcher_take_first($answer, $refused);
+        if ($took === 'lost') {
+            // Its answer lost: once more this tick, $every seconds on, while
+            // the tick has time; else at the next tick, before it polls.
+            if (microtime(true) + $every - $started <= $until) {
+                hive_launcher_sleep($every);
+                hive_launcher_retake_pending();
+            }
+
+            return;
+        }
+        if ($took !== 'none' && $took !== 'refused') {
+            return;
+        }
+
+        // The hot pace keeps to the tick's own clock: polls at 0, 5, 10 ...
+        // 55 seconds into it, however long each took.
+        $polls++;
+        if ($answer['hot'] && $polls * $every <= $until) {
+            hive_launcher_sleep($started + $polls * $every - microtime(true));
+
+            continue;
+        }
+        $next = $answer['next_at'];
+        if ($next !== null && $next + 1 - $started <= $until && $next + 1 > microtime(true)) {
+            hive_launcher_sleep($next + 1 - microtime(true));
+
+            continue;
+        }
+
+        return;
+    }
+}
+
+/** Sleep $seconds, in steps usleep() takes everywhere. */
+function hive_launcher_sleep(float $seconds): void
+{
+    $until = microtime(true) + max(0.0, $seconds);
+    while (($left = $until - microtime(true)) > 0) {
+        usleep((int) min(200_000, max(1, $left * 1_000_000)));
+    }
+}
+
+/**
+ * GET /progress/board-actions/launches, with the ETag of the last answer
+ * (docs/api/board-actions.md, "The poll"). A 200 in its shape is kept with
+ * its ETag; a 304 keeps the last answer and moves only when it was asked.
+ * A 401, 403 or 404 holds every poll for HIVE_LAUNCHER_HOLD. The answer,
+ * or null when there is none to act on: refused, held, a 429, a 5xx, no
+ * answer, or one in no shape.
+ *
+ * @return array{launches: list<array{action: string, act: string, at: int, expires_at: int}>, hot: bool, next_at: ?int}|null
+ */
+function hive_launcher_poll(): ?array
+{
+    $state = hive_launcher_state();
+    $sent = $state['etag'];
+    $result = hive_http('GET', '/progress/board-actions/launches', null, 'progress', $sent !== null ? ['If-None-Match' => $sent] : [],
+        microtime(true) + 5.0);
+    $status = (int) $result['status'];
+    $json = is_array($result['json'] ?? null) ? $result['json'] : [];
+    $etag = trim((string) ($result['headers']['etag'] ?? ''));
+    $etag = $etag !== '' && strlen($etag) <= 200 && preg_match('/^[\x21-\x7E]+$/', $etag) === 1 ? $etag : null;
+    $answer = $status === 200 ? hive_launcher_answer_kept($json) : ($status === 304 && $sent !== null ? $state['answer'] : null);
+
+    hive_launcher_state_mutate(static function (array $doc) use ($status, $answer, $etag, $sent): array {
+        $doc['polled_at'] = time();
+        if ($status === 401 || $status === 403 || $status === 404) {
+            $doc['off_until'] = time() + HIVE_LAUNCHER_HOLD;
+            $doc['etag'] = null;
+            $doc['answer'] = null;
+        } elseif ($status === 200) {
+            $doc['etag'] = $answer !== null ? $etag : null;
+            $doc['answer'] = $answer;
+        } elseif ($status === 304) {
+            $doc['etag'] = $answer !== null ? ($etag ?? $sent) : null;
+        }
+
+        return $doc;
+    });
+
+    return $answer;
+}
+
+/**
+ * Of a poll's launches, the first whose expires_at is still ahead by this
+ * computer's clock, that was not opened here before and that Hive did not
+ * refuse this tick ($refused, which a refusal adds to), taken and opened
+ * (hive_launcher_launch()). `none` when there is none.
+ *
+ * @param  array{launches: list<array{action: string, act: string, at: int, expires_at: int}>, hot: bool, next_at: ?int}  $answer
+ * @param  list<string>  $refused
+ */
+function hive_launcher_take_first(array $answer, array &$refused): string
+{
+    $tried = hive_launcher_state()['tried'];
+    foreach ($answer['launches'] as $launch) {
+        if ($launch['expires_at'] <= time() || array_key_exists($launch['action'], $tried) || in_array($launch['action'], $refused, true)) {
+            continue;
+        }
+
+        $took = hive_launcher_launch($launch);
+        if ($took === 'refused') {
+            $refused[] = $launch['action'];
+        }
+
+        return $took;
+    }
+
+    return 'none';
+}
+
+/**
+ * The launches whose take got no answer (launcher.json `pending`), oldest
+ * first, each taken again (hive_launcher_launch()) while its window lasts.
+ * One that expired by this computer's clock, or was opened here before,
+ * is dropped untaken. Stops at the first that is taken, lost again or
+ * stopped, which it answers; `none` when none was taken.
+ */
+function hive_launcher_retake_pending(): string
+{
+    $state = hive_launcher_state();
+    foreach ($state['pending'] as $ulid => $kept) {
+        $ulid = (string) $ulid;
+        if ($kept['expires_at'] <= time() || array_key_exists($ulid, $state['tried'])) {
+            hive_launcher_state_mutate(static function (array $doc) use ($ulid): array {
+                unset($doc['pending'][$ulid]);
+
+                return $doc;
+            });
+
+            continue;
+        }
+
+        $took = hive_launcher_launch(['action' => $ulid] + $kept);
+        if ($took !== 'refused') {
+            return $took;
+        }
+    }
+
+    return 'none';
+}
+
+/**
+ * POST /progress/board-actions/{action}/take with `via: launch` and mode
+ * `unknown` (docs/api/board-actions.md, "Take with via: launch"): no
+ * session, since a launch is addressed to the computer. Null when Hive gave
+ * no answer -- none, a 429, a 5xx -- and nothing is decided; else the
+ * status, the problem's `code`, and for a 200 its fields as this client
+ * vouches for them (hive_board_taken_shape(), null when it cannot).
+ *
+ * @return array{status: int, code: ?string, taken: ?array{action: string, act: string, ref: string, holder: string|null, plan: string|null, reason: string|null, name: string, at: string, age_seconds: int}}|null
+ */
+function hive_launcher_take(string $ulid): ?array
+{
+    if (! hive_is_ulid($ulid)) {
+        return null;
+    }
+    $result = hive_http('POST', '/progress/board-actions/'.$ulid.'/take', ['via' => 'launch', 'mode' => 'unknown'], 'progress', [],
+        microtime(true) + 5.0);
+    $status = (int) $result['status'];
+    if ($status === 0 || $status === 429 || $status >= 500) {
+        return null;
+    }
+    $json = is_array($result['json'] ?? null) ? $result['json'] : [];
+
+    return [
+        'status' => $status,
+        'code' => is_string($json['code'] ?? null) ? $json['code'] : null,
+        'taken' => $status === 200 ? hive_board_taken_shape($json, $ulid) : null,
+    ];
+}
+
+/**
+ * Take one launch, open it and report what that came to:
+ *
+ *   lost      no answer (none, a 429, a 5xx): Hive may have taken it all
+ *             the same, so it is kept as pending (launcher.json) with its
+ *             act, at and expires_at, and taken again while its window
+ *             lasts (hive_launcher_retake_pending())
+ *   stop      a 409 not_now, a 403: nothing more this tick (a pending
+ *             launch stays pending)
+ *   refused   gone, taken or not found (404, 409, 410): the next poll
+ *             decides, and a pending launch is dropped
+ *   taken     taken: opened and reported (hive_launch_open()); or opened
+ *             here before (a retake), when only the outcome is said again;
+ *             or too old by now to open, when nothing is (Hive expires it)
+ *
+ * A launch is opened only while it is younger than its own window, Hive's
+ * launch_expire_minutes (expires_at less at, at most HIVE_LAUNCH_EXPIRE_MAX):
+ * take's age_seconds says how old it is by Hive's clock.
+ *
+ * @param  array{action: string, act: string, at: int, expires_at: int}  $launch
+ */
+function hive_launcher_launch(array $launch): string
+{
+    $ulid = $launch['action'];
+    $answer = hive_launcher_take($ulid);
+    $tookAt = microtime(true);
+    if ($answer === null) {
+        hive_launcher_state_mutate(static function (array $doc) use ($launch): array {
+            $doc['pending'][$launch['action']] = ['act' => $launch['act'], 'at' => $launch['at'], 'expires_at' => $launch['expires_at']];
+
+            return $doc;
+        });
+
+        return 'lost';
+    }
+    if ($answer['status'] === 403 || hive_prompt_not_now($answer)) {
+        return 'stop';
+    }
+    // Answered: taken or refused, it is pending no more.
+    if (array_key_exists($ulid, hive_launcher_state()['pending'])) {
+        hive_launcher_state_mutate(static function (array $doc) use ($ulid): array {
+            unset($doc['pending'][$ulid]);
+
+            return $doc;
+        });
+    }
+    if ($answer['status'] !== 200) {
+        return 'refused';
+    }
+
+    $tried = hive_launcher_state()['tried'];
+    if (array_key_exists($ulid, $tried)) {
+        if ($tried[$ulid] !== null) {
+            hive_launcher_outcome($ulid, $tried[$ulid]);
+        }
+
+        return 'taken';
+    }
+
+    $taken = $answer['taken'];
+    $window = max(0, min($launch['expires_at'] - $launch['at'], HIVE_LAUNCH_EXPIRE_MAX));
+    $age = $taken !== null ? $taken['age_seconds'] + (int) ceil(microtime(true) - $tookAt) : 0;
+    if ($age >= $window || time() >= $launch['expires_at']) {
+        return 'taken';
+    }
+
+    hive_launcher_state_mutate(static function (array $doc) use ($ulid): array {
+        $doc['tried'][$ulid] = null;
+
+        return $doc;
+    });
+    $line = $taken !== null ? hive_launch_line($taken) : null;
+    hive_launcher_outcome($ulid, $line === null ? 'unsupported' : hive_launch_open($ulid, $line));
+
+    return 'taken';
+}
+
+// -----------------------------------------------------------------------------
+// The launch prompt, and opening the session
+// -----------------------------------------------------------------------------
+
+/**
+ * The launch prompt for a take this client vouched for
+ * (hive_board_taken_shape()), byte for byte as LaunchPrompt::for() writes
+ * it (docs/api/board-actions.md, "The launch prompt"): HIVE_LAUNCH_CLAIM or
+ * HIVE_LAUNCH_TAKEOVER filled from take's own fields, never the poll's. Null
+ * when the line it would make fails the client's own checks: LINE, MAX, its
+ * quotes (none for a claim, the two around a takeover's reason) and
+ * MENTION (no `@`, which Claude Code reads in a user turn as a file to
+ * attach). Refused, never cleaned: the launcher reports `unsupported`.
+ *
+ * @param  array{action: string, act: string, ref: string, holder: string|null, plan: string|null, reason: string|null, name: string, at: string, age_seconds: int}  $taken
+ */
+function hive_launch_line(array $taken): ?string
+{
+    $takeover = $taken['act'] === 'takeover';
+    if ($takeover && preg_match(HIVE_LAUNCH_MENTION, (string) $taken['reason']) === 1) {
+        return null;
+    }
+
+    $line = strtr($takeover ? HIVE_LAUNCH_TAKEOVER : HIVE_LAUNCH_CLAIM, [
+        '{ref}' => $taken['ref'],
+        '{holder}' => (string) $taken['holder'],
+        '{reason}' => (string) $taken['reason'],
+        '{plan_sentence}' => $taken['plan'] === null ? HIVE_LAUNCH_NO_PLAN : strtr(HIVE_LAUNCH_PLAN, ['{plan}' => $taken['plan']]),
+    ]);
+
+    return strlen($line) <= HIVE_LAUNCH_MAX && preg_match(HIVE_LAUNCH_LINE, $line) === 1 && preg_match(HIVE_LAUNCH_MENTION, $line) !== 1
+        && substr_count($line, "'") === ($takeover ? 2 : 0) ? $line : null;
+}
+
+/**
+ * The velu-workspace a launch opens at: the first workspace setup recorded
+ * on this computer (hive_progress_recorded()) whose folder is there, as
+ * this computer spells it. Null when there is none.
+ */
+function hive_launcher_workspace(): ?string
+{
+    foreach (hive_progress_recorded() as [$spelling]) {
+        $spelling = rtrim($spelling, '/');
+        if (($spelling !== '' && $spelling[0] === '/' || preg_match('#^[A-Za-z]:/#', $spelling) === 1) && is_dir($spelling)) {
+            return $spelling;
+        }
+    }
+
+    return null;
+}
+
+/** <hive home>/launch: the launch files' folder, 0700. */
+function hive_launch_dir(): string
+{
+    return hive_home().'/launch';
+}
+
+/** A path in zsh's single quotes, every `'` in it written '\''. */
+function hive_launch_zsh_quote(string $path): string
+{
+    return "'".str_replace("'", "'\\''", $path)."'";
+}
+
+/**
+ * A path in PowerShell's single quotes, every single quote in it doubled:
+ * `'` and the curly ones PowerShell also reads as quotes (U+2018 to U+201B).
+ * Null for a path that is not UTF-8, which cannot be quoted as written:
+ * never an empty literal in its place.
+ */
+function hive_launch_ps_quote(string $path): ?string
+{
+    $quoted = preg_replace("/(['\u{2018}\u{2019}\u{201A}\u{201B}])/u", '$1$1', $path);
+
+    return is_string($quoted) ? "'".$quoted."'" : null;
+}
+
+/**
+ * The macOS opener, <ulid>.command, byte for byte
+ * (docs/api/board-actions.md, "Opening the session"): a login zsh goes to
+ * the workspace, reads the line whole into one variable, removes both
+ * files, and runs `claude` with the line as its one argument. The line
+ * itself is never in it.
+ */
+function hive_launch_command_script(string $workspace, string $txt, string $claude): string
+{
+    return "#!/bin/zsh -l\n"
+        .'cd -- '.hive_launch_zsh_quote($workspace)." || exit 1\n"
+        .'p="$(cat -- '.hive_launch_zsh_quote($txt).')"'."\n"
+        .'rm -f -- '.hive_launch_zsh_quote($txt).' "$0"'."\n"
+        .'exec '.hive_launch_zsh_quote($claude).' "$p"'."\n";
+}
+
+/**
+ * The Windows opener, <ulid>.ps1, byte for byte: the same four steps in
+ * PowerShell, each path as Windows writes it, after
+ * `$ErrorActionPreference = 'Stop'` so a failed Set-Location or
+ * Get-Content stops it before `claude` (the window stays, with the error);
+ * removing the two files may fail without stopping it, as zsh's `rm -f`.
+ * UTF-8 with a byte order mark and CRLF, so Windows PowerShell 5.1 reads a
+ * path with a letter outside ASCII (a user folder named José) as written.
+ * Null when a path cannot be quoted (hive_launch_ps_quote()).
+ */
+function hive_launch_ps1_script(string $workspace, string $txt, string $claude): ?string
+{
+    $ws = hive_launch_ps_quote(hive_launcher_windows_path($workspace));
+    $line = hive_launch_ps_quote(hive_launcher_windows_path($txt));
+    $program = hive_launch_ps_quote(hive_launcher_windows_path($claude));
+    if ($ws === null || $line === null || $program === null) {
+        return null;
+    }
+    $lines = [
+        "\$ErrorActionPreference = 'Stop'",
+        'Set-Location -LiteralPath '.$ws,
+        '$p = Get-Content -LiteralPath '.$line.' -Raw',
+        'Remove-Item -LiteralPath '.$line.', $PSCommandPath -ErrorAction SilentlyContinue',
+        '& '.$program.' $p',
+    ];
+
+    return "\xEF\xBB\xBF".implode("\r\n", $lines)."\r\n";
+}
+
+/**
+ * How the Windows opener is started, in order, each an argv that no
+ * cmd.exe reads: Windows Terminal at the workspace; else PowerShell's
+ * Start-Process opening a new console window that runs the .ps1, its one
+ * line of script given as -EncodedCommand (UTF-16 LE in base64, so
+ * nothing in it is a command line's to parse) with the .ps1's path inside
+ * a PowerShell literal, double-quoted for the console's command line
+ * (Windows paths hold no `"`). Never wt.exe for a path with a `;`, which
+ * it reads as a separator of its own commands; no Start-Process for a path
+ * that cannot be quoted (not UTF-8).
+ *
+ * @return list<list<string>>
+ */
+function hive_launch_windows_argvs(string $workspace, string $ps1): array
+{
+    $ws = hive_launcher_windows_path($workspace);
+    $file = hive_launcher_windows_path($ps1);
+    $argvs = [];
+    if (! str_contains($ws.$file, ';')) {
+        $argvs[] = ['wt.exe', '-d', $ws, 'powershell', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $file];
+    }
+    $quoted = hive_launch_ps_quote('"'.$file.'"');
+    $script = $quoted === null ? null
+        : hive_utf16le_encode("\$ErrorActionPreference = 'Stop'; Start-Process -FilePath 'powershell' -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', ".$quoted);
+    if ($script !== null) {
+        $argvs[] = ['powershell', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', base64_encode($script)];
+    }
+
+    return $argvs;
+}
+
+/**
+ * Write $bytes to $path, new, readable by this user alone: created under a
+ * umask of 077, then set to $mode.
+ */
+function hive_launch_write(string $path, string $bytes, int $mode): bool
+{
+    @unlink($path);
+    $old = umask(0077);
+    try {
+        $written = @file_put_contents($path, $bytes) === strlen($bytes);
+    } finally {
+        umask($old);
+    }
+    @chmod($path, $mode);
+
+    return $written;
+}
+
+/**
+ * Open a new terminal at the workspace running the developer's interactive
+ * `claude` with $line as its one argument (docs/api/board-actions.md,
+ * "Opening the session"), and answer what that came to:
+ *
+ *   no_workspace  no recorded velu-workspace, or its folder is gone, or
+ *                 (Windows) its path cannot be quoted for PowerShell
+ *   no_claude     no `claude` on this computer (hive_launcher_claude())
+ *   unsupported   (Windows) the Hive home's or claude's path cannot be
+ *                 quoted for PowerShell (hive_launch_ps_quote())
+ *   no_terminal   the files could not be written, or no opener started
+ *   opened        an opener started: the session is opening
+ *
+ * The line goes to <hive home>/launch/<ulid>.txt, exactly and with no
+ * newline (the folder 0700, the file 0600), and an opener beside it
+ * (hive_launch_command_script(), hive_launch_ps1_script()), 0700, started
+ * as an argv array: on macOS ['/usr/bin/open', <ulid>.command], which needs
+ * no Automation permission; on Windows wt.exe, else PowerShell's
+ * Start-Process (hive_launch_windows_argvs()). The opener removes both files once it has
+ * read the line; an opener that did not start leaves none behind. Never
+ * `claude -p`, never a permission flag: the session is the developer's,
+ * in their own permission mode.
+ */
+function hive_launch_open(string $ulid, string $line): string
+{
+    if (! hive_is_ulid($ulid)) {
+        return 'unsupported';
+    }
+    $workspace = hive_launcher_workspace();
+    if ($workspace === null) {
+        return 'no_workspace';
+    }
+    $claude = hive_launcher_claude();
+    if ($claude === null) {
+        return 'no_claude';
+    }
+
+    $dir = hive_launch_dir();
+    if (! is_dir($dir) && ! @mkdir($dir, 0700, true) && ! is_dir($dir)) {
+        return 'no_terminal';
+    }
+    @chmod($dir, 0700);
+
+    $windows = hive_launcher_os() === 'Windows';
+    $txt = $dir.'/'.$ulid.'.txt';
+    $opener = $dir.'/'.$ulid.($windows ? '.ps1' : '.command');
+    if ($windows && hive_launch_ps_quote($workspace) === null) {
+        return 'no_workspace';
+    }
+    $script = $windows ? hive_launch_ps1_script($workspace, $txt, $claude) : hive_launch_command_script($workspace, $txt, $claude);
+    if ($script === null) {
+        return 'unsupported';
+    }
+    if (hive_launch_write($txt, $line, 0600) && hive_launch_write($opener, $script, 0700)) {
+        foreach ($windows ? hive_launch_windows_argvs($workspace, $opener) : [['/usr/bin/open', $opener]] as $argv) {
+            if (hive_launcher_run($argv) === 0) {
+                return 'opened';
+            }
+        }
+    }
+
+    @unlink($txt);
+    @unlink($opener);
+
+    return 'no_terminal';
+}
+
+/**
+ * The launch files no opener removed -- a terminal that never ran its
+ * script -- once they are HIVE_LAUNCHER_KEEP old: gone, by the names this
+ * client gives them, and nothing else in the folder.
+ */
+function hive_launcher_sweep_files(): void
+{
+    $dir = hive_launch_dir();
+    foreach (is_dir($dir) ? (@scandir($dir) ?: []) : [] as $name) {
+        $path = $dir.'/'.$name;
+        if (preg_match('/\A[0-9A-HJKMNP-TV-Z]{26}\.(?:txt|command|ps1)\z/', $name) === 1 && is_file($path)
+            && time() - (int) @filemtime($path) >= HIVE_LAUNCHER_KEEP) {
+            @unlink($path);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Upkeep at a session start, doctor and purge
+// -----------------------------------------------------------------------------
+
+/**
+ * Session start's part (hive_verb_session_start(), last, after its answer):
+ * the launcher installed, rewritten or removed as the policy this start
+ * just fetched says (docs/api/board-actions.md, "The policy's
+ * board.launch"). Never in a headless run, never while Hive is off here,
+ * has no token or no https address, and only from a fresh picture:
+ *
+ *   uninstall  the agent is here (or, on Windows, launcher.json is lost:
+ *              hive_launcher_maybe_present()) and the policy says
+ *              board.launch false, or HIVE_BOARD_LAUNCH=0 keeps it off on
+ *              this computer. Never for a policy with no board block or no
+ *              `launch`
+ *   install    board.launch true and the agent is missing or differs from
+ *              what this client would write now (hive_launcher_current());
+ *              on a computer that cannot run it, once, so Hive hears
+ *              `unsupported`
+ *
+ * The work runs detached (`launcher install|uninstall`, through
+ * hive_spawn_background(), which closes this process's stdio: last), or
+ * inline and silent with HIVE_BACKGROUND=0. Deciding costs a few stats: no
+ * request and no program is started here.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_launcher_upkeep(array $session): void
+{
+    if (hive_is_disabled() || hive_is_headless() || hive_progress_blocked() !== null) {
+        return;
+    }
+    if (! hive_launcher_on()) {
+        if (hive_launcher_maybe_present()) {
+            hive_launcher_upkeep_run('uninstall');
+        }
+
+        return;
+    }
+
+    $cache = hive_waits_policy($session);
+    if (hive_cache_tier($cache) !== 'fresh') {
+        return;
+    }
+    $launch = hive_launcher_policy($cache)['launch'];
+    if ($launch === false) {
+        if (hive_launcher_maybe_present()) {
+            hive_launcher_upkeep_run('uninstall');
+        }
+
+        return;
+    }
+    if ($launch !== true) {
+        return;
+    }
+
+    if (hive_launcher_unsupported() !== null) {
+        $reported = hive_launcher_state()['reported'];
+        if ($reported === null || $reported['state'] !== 'unsupported' || (! $reported['heard'] && time() - $reported['at'] >= HIVE_LAUNCHER_KEEP)) {
+            hive_launcher_upkeep_run('install');
+        }
+
+        return;
+    }
+    if (! hive_launcher_present() || ! hive_launcher_current()) {
+        hive_launcher_upkeep_run('install');
+    }
+}
+
+/** `launcher install` or `uninstall`, detached; inline and silent with HIVE_BACKGROUND=0. */
+function hive_launcher_upkeep_run(string $verb): void
+{
+    if (hive_env('HIVE_BACKGROUND', '1') === '1' && hive_spawn_background(['launcher', $verb])) {
+        return;
+    }
+
+    if ($verb === 'install') {
+        hive_launcher_install(false);
+    } else {
+        hive_launcher_uninstall(false);
+    }
+}
+
+/** The OS agent as a person names it: the LaunchAgent's file, or the Scheduled Task. */
+function hive_launcher_agent_name(): string
+{
+    return hive_launcher_os() === 'Darwin' ? hive_launcher_plist_path() : 'the Scheduled Task '.HIVE_LAUNCHER_TASK;
+}
+
+/**
+ * doctor's launcher row: whether the developer switched it on for this
+ * computer, whether the OS agent is here and as this client would write
+ * it, whether the tick can read a token (the OS agent never sees a
+ * terminal's environment: only <home>/.env.hive), Hive's hold, and the
+ * last poll. Said, never fixed: a session start does the upkeep.
+ *
+ * @return array{0: string, 1: string}
+ */
+function hive_doctor_launcher(): array
+{
+    $policy = hive_launcher_policy(hive_policy_cache_any());
+    $present = hive_launcher_present();
+    $unsupported = hive_launcher_unsupported();
+    $state = hive_launcher_state();
+
+    if (! hive_launcher_on()) {
+        return $present
+            ? ['WARN', 'HIVE_BOARD_LAUNCH=0 keeps it off on this computer, and '.hive_launcher_agent_name().' is still here: the next session start removes it']
+            : ['ok', 'off on this computer (HIVE_BOARD_LAUNCH=0): a board approval reaches a session here only while one runs'];
+    }
+    if (! $present) {
+        if ($policy['launch'] !== true) {
+            return ['ok', $policy['launch'] === null
+                ? 'not served here yet: a Hive before the launcher, or no picture cached'
+                : 'off for this computer ("Open a new session on this computer" on /board -> My access -> My machines)'];
+        }
+
+        return $unsupported !== null
+            ? ['WARN', 'switched on for this computer, which cannot run it ('.$unsupported.'): a board approval reaches a session here only while one runs']
+            : ['WARN', 'switched on for this computer and not installed yet: the next session start installs it'];
+    }
+
+    $file = (string) @file_get_contents(hive_home().'/.env.hive');
+    if (preg_match('/^\s*(?:export\s+)?HIVE_TOKEN\s*=\s*\S/m', $file) !== 1) {
+        return ['WARN', 'installed ('.hive_launcher_agent_name().'), but '.hive_home().'/.env.hive holds no HIVE_TOKEN, and the launcher sees no other: it asks Hive nothing'];
+    }
+    if ($state['off_until'] > time()) {
+        return ['WARN', 'installed ('.hive_launcher_agent_name().'); Hive refused its polls, which wait until '.date('H:i', $state['off_until'])];
+    }
+    if ($policy['launch'] === false) {
+        return ['WARN', 'installed ('.hive_launcher_agent_name().') but switched off for this computer: the next session start removes it'];
+    }
+    if (! hive_launcher_current()) {
+        return ['WARN', hive_launcher_agent_name().' differs from what Hive would write now: the next session start rewrites it'];
+    }
+
+    return ['ok', 'installed ('.hive_launcher_agent_name().', every '.HIVE_LAUNCHER_INTERVAL.' s); '
+        .($state['polled_at'] > 0 ? 'last poll '.hive_ago(time() - $state['polled_at']).' ago' : 'no poll yet')
+        .($state['reported'] !== null && $state['reported']['heard'] ? '; Hive has it as '.$state['reported']['state'] : '; Hive has not heard it yet')];
+}
+
+/**
+ * purge's part (`purge --yes`, step 1c): the OS agent unloaded and removed
+ * before the client it runs goes, and Hive told `removed`. On Windows the
+ * task is always looked for (hive_launcher_uninstall()), whatever
+ * launcher.json remembers. Null when there is none; else [what it came to,
+ * the step's words].
+ *
+ * @return array{0: string, 1: string}|null
+ */
+function hive_purge_launcher(): ?array
+{
+    if (hive_launcher_os() !== 'Windows' && ! hive_launcher_present()) {
+        return null;
+    }
+    $name = hive_launcher_agent_name();
+    $gone = hive_launcher_uninstall(false);
+    if ($gone === 'none') {
+        return null;
+    }
+
+    return $gone === 'failed' ? ['failed', 'could not remove '.$name] : ['removed', 'removed '.$name.', which opened new Claude sessions for board approvals'];
 }
 
 // =============================================================================
