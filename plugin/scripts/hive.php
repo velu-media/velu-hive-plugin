@@ -380,7 +380,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.19.0';
+const HIVE_VERSION = '1.20.0';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1340,6 +1340,10 @@ const HIVE_PROGRESS_NEXT_ELSEWHERE = 'HIVE NEXT: Progress commands do nothing fr
 */
 const HIVE_RULES_TOPICS = ['rulings', 'workplans', 'slices', 'choices', 'notes', 'setup'];
 const HIVE_RULES_TOPIC_MAX = 65536;
+// Words `progress help` takes for a topic, beside its name (client 1.20.0):
+// a board approval's block (kind="claim") is explained by `notes`, and the
+// C1 rehearsal's agents asked for it as `claim`. Never a topic of its own.
+const HIVE_RULES_TOPIC_ALIASES = ['claim' => 'notes'];
 
 /*
 | Agents' work plans (client 1.10.0; SECTION 18d, privacy rule 1a). The
@@ -1672,6 +1676,11 @@ const HIVE_BROKER_PARAM_KEYS = [
 // (hive.rooms.prompts.max_chars, never raised by an owner).
 const HIVE_NUDGE_VERBS = ['status', 'push', 'finish_then_stop', 'set_aside', 'wait_for_me'];
 const HIVE_PROMPT_KINDS = ['nudge', 'text'];
+// Board approvals (docs/api/board-actions.md): the pointer's `kind` may
+// also be `claim`, a Claim or Take over the developer approved on the
+// board (BoardFields::POINTER_KIND). Its `prompt` names a board action, not
+// an agent prompt; HIVE_PROMPT_KINDS stays PromptKind's.
+const HIVE_POINTER_KINDS = ['nudge', 'text', 'claim'];
 const HIVE_PROMPT_CHARS_MAX = 500;
 const HIVE_BROKER_MERGE_METHODS = ['merge', 'squash', 'rebase'];
 // Standing consents (client 1.13.0): ConsentKind, in its order, and how
@@ -7779,8 +7788,10 @@ function hive_breaker_hold(string $host, int $seconds, string $reason): void
  *             lease and release, autopilot, a takeover, an answer, a
  *             request, a question to a person, an override -- and
  *             1.12.0's, a session's label and a handover given or refused,
- *             and the rooms' take of a developer's note and the agent's say,
- *             capped by the hour too (hive.broker.caps.writes_per_hour)
+ *             the rooms' take of a developer's note and the agent's say,
+ *             and the take of a board action the developer approved
+ *             (SECTION 34b), capped by the hour too
+ *             (hive.broker.caps.writes_per_hour)
  *
  * An hourly cap answers Retry-After up to the rest of the hour, and the
  * machine's claims, heartbeats, snapshots and checks, which have budgets of
@@ -7801,7 +7812,7 @@ function hive_hold_class(string $method, string $path): ?string
     }
     if ($method === 'POST' && preg_match('#^/progress/(?:workplans/[^/]+/state|lanes/next|lanes/[^/]+/(?:lease|release)|autopilot|backlog/[^/]+/takeover'
         .'|backlog/[^/]+/handover(?:/refuse)?|inbox/[^/]+/answer|requests|decisions|cases/[^/]+/override|automations/[^/]+/(?:lease|report)'
-        .'|prompts/[^/]+/take|says)$#', $route) === 1) {
+        .'|prompts/[^/]+/take|board-actions/[^/]+/take|says)$#', $route) === 1) {
         return 'broker';
     }
     if ($method === 'PUT' && preg_match('#^/progress/sessions/[^/]+/label$#', $route) === 1) {
@@ -18378,7 +18389,7 @@ function hive_purge_is_home_file(string $name): bool
  * progress/<16 hex>.json, .summaries.json, .lock and .push
  * (hive_progress_ctx) and nudged.json with its lock (hive_nudged_once),
  * waits.json, its lock, decisions.json and its lock (SECTION 31), .waits.json and each session's <32 hex>.turn and
- * .watch.lock (SECTION 18e), <32 hex>.prompts.json and its lock (SECTION 34), .next.json (SECTION 18f), plans/<32 hex>.json, .lock and .sync
+ * .watch.lock (SECTION 18e), <32 hex>.prompts.json and its lock (SECTION 34), <32 hex>.watch.root (SECTION 34b), .next.json (SECTION 18f), plans/<32 hex>.json, .lock and .sync
  * (hive_spool_path) and .swept, workplans/<32 hex>.plan-files.json and .lock
  * and workplans/spool/<32 hex>.json (SECTION 30), topics/<topic>.md for
  * each of HIVE_RULES_TOPICS (client 1.18.0), and
@@ -18392,7 +18403,7 @@ function hive_purge_is_state_file(string $folder, string $name): bool
         'cache' => '[0-9a-f]{20}\.json',
         'progress' => '(?:[0-9a-f]{16}(?:\.json|\.summaries\.json|\.lock|\.push)|nudged\.json(?:\.lock)?|waits\.(?:json|lock)|decisions\.(?:json|lock)'
             .'|\.waits\.json|\.next\.json'
-            .'|[0-9a-f]{32}\.(?:turn|watch\.lock|prompts\.(?:json|lock)))',
+            .'|[0-9a-f]{32}\.(?:turn|watch\.lock|watch\.root|prompts\.(?:json|lock)))',
         'plans' => '(?:[0-9a-f]{32}\.(?:json|lock|sync)|\.swept)',
         'workplans' => '[0-9a-f]{32}\.plan-files\.(?:json|lock)',
         'spool' => '[0-9a-f]{32}\.json',
@@ -21997,13 +22008,15 @@ function hive_progress_out(array $lines, string $next, int $exit, array $after =
  * a Hive older than the topics, whose CLAUDE.local.md holds the whole text
  * -- one line naming that file, exit 0. With no topic, the list, exit 0;
  * with one that is not a topic, the list, exit 2. The topic is a word
- * matched against the fixed list, never a path.
+ * matched against the fixed list, never a path; a word of
+ * HIVE_RULES_TOPIC_ALIASES (`claim`) is the topic it names.
  *
  * @param  list<string>  $rest
  */
 function hive_progress_verb_help(array $rest): int
 {
     $asked = strtolower(trim((string) ($rest[0] ?? '')));
+    $asked = HIVE_RULES_TOPIC_ALIASES[$asked] ?? $asked;
     $cmd = hive_rules_topic_values()['{{hive}}'];
     if ($asked === '' || ! in_array($asked, HIVE_RULES_TOPICS, true)) {
         return hive_progress_out(
@@ -29293,6 +29306,8 @@ function hive_slice_parse($value): ?array
 //                                       again, whose watcher, if it began
 //                                       before that flush, then stops
 //   <home>/progress/<digest>.watch.lock one watcher per session
+//   <home>/progress/<digest>.watch.root its session is at the workspace
+//                                       root (SECTION 34b): an empty mark
 
 // -----------------------------------------------------------------------------
 // This machine's parks, and Hive's last word on them
@@ -29720,7 +29735,15 @@ function hive_waits_fetch(string $profile, ?float $deadline = null, ?string &$wh
     } catch (Throwable $e) {
         $watching = [];
     }
-    $result = hive_http('GET', '/progress/waits'.($watching !== [] ? '?watching='.implode(',', $watching) : ''), null, $profile, $headers, $deadline);
+    // Board approvals (SECTION 34b): those of them at the workspace root,
+    // whose session an approval may wake. Digests only, never a path.
+    try {
+        $root = hive_prompt_watching_root($watching);
+    } catch (Throwable $e) {
+        $root = [];
+    }
+    $query = $watching !== [] ? '?watching='.implode(',', $watching).($root !== [] ? '&watching_root='.implode(',', $root) : '') : '';
+    $result = hive_http('GET', '/progress/waits'.$query, null, $profile, $headers, $deadline);
     $status = (int) $result['status'];
     $json = is_array($result['json']) ? $result['json'] : [];
 
@@ -29856,7 +29879,8 @@ function hive_waits_sweep(): void
     }
 
     $cutoff = time() - 7200;
-    $files = array_merge(glob(hive_home().'/progress/*.turn') ?: [], glob(hive_home().'/progress/*.watch.lock') ?: []);
+    $files = array_merge(glob(hive_home().'/progress/*.turn') ?: [], glob(hive_home().'/progress/*.watch.lock') ?: [],
+        glob(hive_home().'/progress/*.watch.root') ?: []);
     foreach (array_slice($files, 0, 500) as $file) {
         $digest = substr(basename($file), 0, 32);
         if (preg_match('/^[0-9a-f]{32}$/', $digest) === 1 && ! isset($keep[$digest]) && (int) @filemtime($file) < $cutoff) {
@@ -30527,6 +30551,14 @@ function hive_resume_watch_gate(array $input): ?array
     // When it was taken: the sweep never removes a lock a watcher holds, and
     // the next watcher knows whether the turn marker is newer than this one.
     @touch($path);
+    // Board approvals (SECTION 34b): whether this session is at the
+    // workspace root, for the waits poll's watching_root=. A fault marks
+    // nothing: the session is then not offered a wake.
+    try {
+        hive_board_watch_mark($digest, $session);
+    } catch (Throwable $e) {
+        // Not named at the root; the watch goes on.
+    }
 
     return ['digest' => $digest, 'session' => $session, 'session_id' => $sessionId, 'lock' => $lock, 'broker' => $broker,
         'prompts' => $prompts, 'parked' => $parked, 'input' => $input];
@@ -30582,7 +30614,13 @@ function hive_resume_watch_lock($lock, string $path, string $digest): bool
  * Client 1.14.0: armed for the developer's prompts (`prompts`), it says the
  * first of them first (hive_prompt_watch_say()) and watches for
  * prompts.watch_seconds when they are its only reason
- * (hive_resume_watch_window()). Its poll claims the question under the
+ * (hive_resume_watch_window()). Armed by them alone -- every Stop of a
+ * board approvals client (1.20.0) -- it watches for them alone: what the
+ * broker would wake an idle session for (hive_broker_watch_item()) waits
+ * for the session's next flush, as it did when no watcher ran there, so
+ * arming for approvals wakes nothing the broker did not arm the watcher
+ * for. Armed by a park or the broker too, it says the broker's items as
+ * before (hive_resume_watch_prompts_only()). Its poll claims the question under the
  * waits lock (hive_waits_claim_poll()), so the watchers of one computer ask
  * once between them, and names every live watcher (`watching=`).
  *
@@ -30592,6 +30630,7 @@ function hive_resume_watch_run(array $watch): int
 {
     $began = hive_process_started();
     $window = hive_resume_watch_window($watch);
+    $promptsOnly = hive_resume_watch_prompts_only($watch);
     $stop = microtime(true) + max(0, $window - HIVE_WATCH_MARGIN);
     $digest = $watch['digest'];
     $marker = hive_waits_turn_read($digest);
@@ -30641,11 +30680,12 @@ function hive_resume_watch_run(array $watch): int
         // Said once: a flush of the session that said it first leaves the
         // watcher nothing to say (hive_broker_say()). An error in the
         // broker's part says nothing and arms nothing: the watch of a park
-        // goes on as batch 6's.
+        // goes on as batch 6's. A watcher the prompts alone armed says
+        // none of the broker's items and is kept by the prompts alone.
         try {
-            $item = hive_broker_watch_item($watch['session'], $digest);
+            $item = $promptsOnly ? null : hive_broker_watch_item($watch['session'], $digest);
             $woke = $item !== null && $item['message'] !== null && hive_broker_say($item, $digest, time()) === 2;
-            $armed = $woke || hive_broker_watch_arm($digest, $watch['session'])
+            $armed = $woke || (! $promptsOnly && hive_broker_watch_arm($digest, $watch['session']))
                 || (! empty($watch['prompts']) && hive_prompt_watch_arm($watch['session']));
         } catch (Throwable $e) {
             $woke = false;
@@ -39570,7 +39610,7 @@ function hive_broker_typed(string $grammar, $value)
         case 'checks':
             return is_string($value) && in_array($value, HIVE_BROKER_CHECKS, true) ? $value : null;
         case 'prompt_kind':
-            return is_string($value) && in_array($value, HIVE_PROMPT_KINDS, true) ? $value : null;
+            return is_string($value) && in_array($value, HIVE_POINTER_KINDS, true) ? $value : null;
         case 'nudge':
             return is_string($value) && in_array($value, HIVE_NUDGE_VERBS, true) ? $value : null;
         case 'chars':
@@ -49465,6 +49505,10 @@ function hive_activity_news(array $doc): bool
  * that one's state. Taken whether or not the report reaches Hive, so a
  * report built after a put-back is numbered after the one put back.
  *
+ * Board approvals (SECTION 34b): `ws`, where the session's base folder sits
+ * against the recorded workspace (hive_board_ws(): root, inside or none, a
+ * word, never a path), and `hl`, whether it is headless (hive_is_headless()).
+ *
  * From section 2.8d it also carries the session's `model` when the session
  * file holds one, and its sub-agents: `agents`, at most
  * HIVE_ACTIVITY_SUBAGENTS_MAX, running first, then those finished most
@@ -49506,7 +49550,7 @@ function hive_activity_news(array $doc): bool
  *            Null for `ended`, which is never put back: the session is
  *            over, and Hive calls it idle, then gone, on its own.
  *
- * @return array{client_session: string, state: string, seq: int, tools: array<string, array<string, int>>, model?: string, agents?: list<array{id: string, parent: string|null, type: string|null, state: string, kinds: array<string, int>, started_ago: int, ended_ago: int|null}>, agents_more?: int, _alone: bool, _back: array<string, mixed>|null}|null
+ * @return array{client_session: string, state: string, seq: int, tools: array<string, array<string, int>>, ws: string, hl: bool, model?: string, agents?: list<array{id: string, parent: string|null, type: string|null, state: string, kinds: array<string, int>, started_ago: int, ended_ago: int|null}>, agents_more?: int, _alone: bool, _back: array<string, mixed>|null}|null
  */
 function hive_activity_report(string $sessionId, string $state, int $now): ?array
 {
@@ -49523,7 +49567,7 @@ function hive_activity_report(string $sessionId, string $state, int $now): ?arra
     $unsupported = is_int($session['snapshots_unsupported_at'] ?? null) ? $session['snapshots_unsupported_at'] : 0;
     $report = null;
 
-    hive_broker_state_mutate('activity-'.$digest, static function (array $raw) use ($digest, $state, $now, $model, $paces, $unsupported, &$report): array {
+    hive_broker_state_mutate('activity-'.$digest, static function (array $raw) use ($digest, $state, $now, $model, $paces, $unsupported, $session, &$report): array {
         $doc = hive_activity_shape($raw, $now);
         $ended = false;
         foreach ($doc['agents'] as $agent) {
@@ -49556,7 +49600,10 @@ function hive_activity_report(string $sessionId, string $state, int $now): ?arra
         }
 
         $seq = $doc['seq'] + 1;
-        $report = ['client_session' => $digest, 'state' => $state, 'seq' => $seq, 'tools' => $doc['tools']];
+        // Board approvals: where the session sits against the recorded
+        // workspace, a word, and whether it is headless (SECTION 34b).
+        $report = ['client_session' => $digest, 'state' => $state, 'seq' => $seq, 'tools' => $doc['tools'],
+            'ws' => hive_board_ws($session), 'hl' => hive_is_headless()];
         if ($model !== null) {
             $report['model'] = $model;
         }
@@ -49644,6 +49691,12 @@ function hive_activity_public(array $report): array
         $public['seq'] = $report['seq'];
     }
     $public['tools'] = $report['tools'] ?? [];
+    // Board approvals: `ws` one word of HIVE_BOARD_WS and `hl` a boolean,
+    // or neither: never a path.
+    if (in_array($report['ws'] ?? null, HIVE_BOARD_WS, true) && is_bool($report['hl'] ?? null)) {
+        $public['ws'] = $report['ws'];
+        $public['hl'] = $report['hl'];
+    }
     foreach (['model', 'agents', 'agents_more'] as $key) {
         if (array_key_exists($key, $report)) {
             $public[$key] = $report[$key];
@@ -52337,21 +52390,23 @@ function hive_prompt_pointer_path(string $digest): string
 /**
  * The pointer file as the client may use it:
  *
- *   prompts  prompt ulid => {message, at, via}: a note this session was told
- *            of and has not been given, oldest first, at most
+ *   prompts  prompt ulid => {message, at, via, kind}: a note this session
+ *            was told of and has not been given, oldest first, at most
  *            HIVE_PROMPT_POINTERS_MAX, none older than
  *            HIVE_PROMPT_POINTER_KEEP; `via` is how its take will say it
- *            came (stop or wake)
+ *            came (stop or wake). `kind` is `text`, or `claim` for a board
+ *            action the developer approved (SECTION 34b), whose ulid names
+ *            a board action; a file an older client wrote holds notes only
  *   tried    prompt ulid => when a take met no answer, for
  *            HIVE_PROMPT_RETRY
  *   wakes    when the idle watcher woke the session for a prompt, the last
  *            hour's: the prompts' own count, apart from the broker's
  *            (prompts.wakes_per_hour; the design's Ruling 15)
  *
- * It holds ulids and times only, never a word.
+ * It holds ulids, times and closed words only, never a word of a note.
  *
  * @param  array<string, mixed>  $raw
- * @return array{prompts: array<string, array{message: string, at: int, via: string}>, tried: array<string, int>, wakes: list<int>}
+ * @return array{prompts: array<string, array{message: string, at: int, via: string, kind: string}>, tried: array<string, int>, wakes: list<int>}
  */
 function hive_prompt_pointer_shape(array $raw, int $now): array
 {
@@ -52363,7 +52418,8 @@ function hive_prompt_pointer_shape(array $raw, int $now): array
         if (! hive_is_ulid($ulid) || $message === null || ! hive_is_ulid($message) || $at > $now + 60 || $now - $at > HIVE_PROMPT_POINTER_KEEP) {
             continue;
         }
-        $doc['prompts'][$ulid] = ['message' => $message, 'at' => $at, 'via' => in_array($pointer['via'] ?? null, ['stop', 'wake'], true) ? $pointer['via'] : 'stop'];
+        $doc['prompts'][$ulid] = ['message' => $message, 'at' => $at, 'via' => in_array($pointer['via'] ?? null, ['stop', 'wake'], true) ? $pointer['via'] : 'stop',
+            'kind' => ($pointer['kind'] ?? null) === HIVE_BOARD_POINTER_KIND ? HIVE_BOARD_POINTER_KIND : 'text'];
     }
     uasort($doc['prompts'], static fn (array $a, array $b): int => $a['at'] <=> $b['at']);
     $doc['prompts'] = array_slice($doc['prompts'], -HIVE_PROMPT_POINTERS_MAX, null, true);
@@ -52387,7 +52443,7 @@ function hive_prompt_pointer_shape(array $raw, int $now): array
  * The session's pointers as they are on disk, shaped. One stat when the
  * session has none.
  *
- * @return array{prompts: array<string, array{message: string, at: int, via: string}>, tried: array<string, int>, wakes: list<int>}
+ * @return array{prompts: array<string, array{message: string, at: int, via: string, kind: string}>, tried: array<string, int>, wakes: list<int>}
  */
 function hive_prompt_pending(string $digest): array
 {
@@ -52405,8 +52461,8 @@ function hive_prompt_pending(string $digest): array
  * the file goes. Null when the lock was not had: the caller goes on as if
  * nothing were kept.
  *
- * @param  callable(array{prompts: array<string, array{message: string, at: int, via: string}>, tried: array<string, int>, wakes: list<int>}): array{prompts: array<string, array{message: string, at: int, via: string}>, tried: array<string, int>, wakes: list<int>}  $change
- * @return array{prompts: array<string, array{message: string, at: int, via: string}>, tried: array<string, int>, wakes: list<int>}|null
+ * @param  callable(array{prompts: array<string, array{message: string, at: int, via: string, kind: string}>, tried: array<string, int>, wakes: list<int>}): array{prompts: array<string, array{message: string, at: int, via: string, kind: string}>, tried: array<string, int>, wakes: list<int>}  $change
+ * @return array{prompts: array<string, array{message: string, at: int, via: string, kind: string}>, tried: array<string, int>, wakes: list<int>}|null
  */
 function hive_prompt_pointers_mutate(string $digest, callable $change): ?array
 {
@@ -52456,11 +52512,11 @@ function hive_prompt_pointers_mutate(string $digest, callable $change): ?array
     }
 }
 
-/** Keeps a note's pointer for this session, to be given at its synchronous Stop. */
-function hive_prompt_keep(string $digest, string $prompt, string $message, string $via): bool
+/** Keeps a note's pointer for this session, or a board action's ($kind `claim`), to be given at its synchronous Stop. */
+function hive_prompt_keep(string $digest, string $prompt, string $message, string $via, string $kind = 'text'): bool
 {
-    return hive_prompt_pointers_mutate($digest, static function (array $doc) use ($prompt, $message, $via): array {
-        $doc['prompts'][$prompt] = ['message' => $message, 'at' => $doc['prompts'][$prompt]['at'] ?? time(), 'via' => $via];
+    return hive_prompt_pointers_mutate($digest, static function (array $doc) use ($prompt, $message, $via, $kind): array {
+        $doc['prompts'][$prompt] = ['message' => $message, 'at' => $doc['prompts'][$prompt]['at'] ?? time(), 'via' => $via, 'kind' => $kind];
 
         return $doc;
     }) !== null;
@@ -52741,12 +52797,18 @@ function hive_prompt_in_subagent(array $input): bool
  *   a nudge  its block, once take answered 200 ($via, the hook's own mode);
  *            the owners' off line while the cached policy has nudges off,
  *            or on Hive's 403 prompts_off
+ *   a claim  only in a session at the workspace root ($session,
+ *            hive_board_root()): the async flush ($via `stop`) says
+ *            HIVE_BOARD_POINTER alone and keeps the pointer for the Stop,
+ *            never a take; the idle watcher ($via `wake`) takes it and says
+ *            its whole block (hive_board_line(), SECTION 34b)
  *
  * @param  array<string, mixed>  $message  one of hive_broker_block()'s
  * @param  array<string, mixed>  $settings  hive_prompt_settings()
  * @param  array<string, string>  $input  the hook's own input
+ * @param  array<string, mixed>  $session  the session's file, for a claim
  */
-function hive_prompt_line(array $message, string $sessionDigest, array $settings = [], array $input = [], string $via = 'stop'): ?string
+function hive_prompt_line(array $message, string $sessionDigest, array $settings = [], array $input = [], string $via = 'stop', array $session = []): ?string
 {
     if (hive_prompt_in_subagent($input) || ! hive_prompt_for_session($message, $sessionDigest) || ! hive_prompts_on() || hive_is_headless()) {
         return null;
@@ -52758,6 +52820,10 @@ function hive_prompt_line(array $message, string $sessionDigest, array $settings
     $id = hive_str($message['message'] ?? null);
     if ($prompt === null || ! hive_is_ulid($prompt) || $id === null || ! hive_is_ulid($id)) {
         return null;
+    }
+
+    if (($params['kind'] ?? null) === HIVE_BOARD_POINTER_KIND) {
+        return hive_board_line($prompt, $id, $sessionDigest, $session, $input, $via);
     }
 
     if (($params['kind'] ?? null) === 'text') {
@@ -52823,7 +52889,7 @@ function hive_prompt_flush_say(string $sessionId, array $session, array $input):
         if (isset($said[$message['message']])) {
             continue;
         }
-        $line = hive_prompt_line($message, $digest, $settings, $input, 'stop');
+        $line = hive_prompt_line($message, $digest, $settings, $input, 'stop', $session);
         if ($line === null) {
             continue;
         }
@@ -52865,6 +52931,13 @@ function hive_prompt_flush_say(string $sessionId, array $session, array $input):
  *
  * One note at most: a second waits for the next Stop.
  *
+ * A board action the developer approved (kind `claim`, SECTION 34b) goes
+ * before any note, in every permission mode, and only at a Stop: never at
+ * a session's start ($via session_start), which leaves it for the Stop.
+ * It is given as hive_board_give() gives it. One that settles with nothing
+ * to say (gone, taken, not found) lets the next pointer be given at the
+ * same Stop: it printed no block.
+ *
  * @param  array<string, string>  $input
  * @param  array<string, mixed>  $session
  */
@@ -52890,10 +52963,24 @@ function hive_prompt_deliver(array $input, array $session = [], ?string $via = n
     $session = $session !== [] ? $session : hive_session_load($sessionId);
     $settings = hive_prompt_settings_of($session);
     $mode = hive_prompt_mode($input);
-    foreach ($pending['prompts'] as $prompt => $pointer) {
+    // A waiting claim before a waiting note: it expires in a quarter of
+    // the time (board_actions.expire_minutes, against a note's hour).
+    $claims = array_filter($pending['prompts'], static fn (array $pointer): bool => $pointer['kind'] === HIVE_BOARD_POINTER_KIND);
+    foreach ($claims + $pending['prompts'] as $prompt => $pointer) {
         $prompt = (string) $prompt;
         if (isset($pending['tried'][$prompt])) {
             continue;
+        }
+        if ($pointer['kind'] === HIVE_BOARD_POINTER_KIND) {
+            if ($via === 'session_start') {
+                continue;
+            }
+            $given = hive_board_give($digest, $prompt, 'stop', $session, $input);
+            if ($given === '') {
+                continue;
+            }
+
+            return $given;
         }
         if (! $settings['text']) {
             hive_prompt_forget($digest, $prompt);
@@ -53001,12 +53088,24 @@ function hive_prompt_watch_arm(array $session): bool
 function hive_resume_watch_window(array $watch): int
 {
     $policy = hive_broker_policy(hive_waits_policy(is_array($watch['session'] ?? null) ? $watch['session'] : []));
-    $promptsOnly = ! empty($watch['prompts']) && empty($watch['broker']) && empty($watch['parked']);
 
-    return min(hive_watch_timeout(), $promptsOnly ? $policy['prompts']['watch_seconds'] : $policy['watch_seconds']);
+    return min(hive_watch_timeout(), hive_resume_watch_prompts_only($watch) ? $policy['prompts']['watch_seconds'] : $policy['watch_seconds']);
 }
 
-/** Whether the watcher may wake this session again this hour for a prompt: prompts.wakes_per_hour, apart from the broker's. */
+/**
+ * Whether the developer's prompts alone armed this watch: no park and not
+ * the broker (hive_resume_watch_gate()). Such a watch is held to
+ * prompts.watch_seconds (hive_resume_watch_window()) and says only the
+ * prompts' and claims' words (hive_resume_watch_run()).
+ *
+ * @param  array<string, mixed>  $watch  hive_resume_watch_gate()'s
+ */
+function hive_resume_watch_prompts_only(array $watch): bool
+{
+    return ! empty($watch['prompts']) && empty($watch['broker']) && empty($watch['parked']);
+}
+
+/** Whether the watcher may wake this session again this hour for a note or a nudge: prompts.wakes_per_hour, apart from the broker's and from a claim's. */
 function hive_prompt_wake_allowed(string $digest, int $perHour): bool
 {
     return $perHour > 0 && count(hive_prompt_pending($digest)['wakes']) < $perHour;
@@ -53015,12 +53114,20 @@ function hive_prompt_wake_allowed(string $digest, int $perHour): bool
 /**
  * The idle watcher's part (hive_resume_watch_run()): the first pointer for
  * this session it has not been told, in the pictures or the waits poll,
- * that may wake it this hour. A note wakes it with the pointer line alone
+ * that may wake it now. A note wakes it with the pointer line alone
  * -- its pointer kept `via: wake`, never a take, never a word (the design's
- * Ruling 25) -- and a nudge with its block once take answered 200. An
+ * Ruling 25) -- and a nudge with its block once take answered 200, each
+ * within prompts.wakes_per_hour (hive_prompt_wake_allowed()). A board
+ * action (kind `claim`, SECTION 34b) wakes it with its whole block, taken
+ * `via: wake`; one the Stop kept and could not take goes first
+ * (hive_board_watch_kept()). A claim has its own allowance: it is its
+ * developer's explicit approval for this one session, given once, which
+ * Hive already limits (board_actions.per_developer_per_day and
+ * open_per_developer), and Hive offers it as a wake whatever the notes'
+ * hour holds; so it is neither held by nor counted in wakes_per_hour. An
  * off line is settled without a wake: nothing waits for the agent to do.
- * Marked said before a word goes out, then seen on Hive. True when it woke
- * the session (stderr, for exit 2).
+ * Marked said before a word goes out, then seen on Hive. True when it
+ * woke the session (stderr, for exit 2).
  *
  * @param  array<string, mixed>  $session
  * @param  array<string, string>  $input  the watcher's own Stop input
@@ -53031,16 +53138,21 @@ function hive_prompt_watch_say(array $session, string $digest, array $input): bo
         return false;
     }
     $settings = hive_prompt_settings_of($session);
-    if (! hive_prompt_wake_allowed($digest, $settings['wakes_per_hour'])) {
-        return false;
+
+    // A board action a Stop kept and could not take (Hive gave no answer)
+    // first: it expires in a quarter of an hour (SECTION 34b).
+    if (hive_board_watch_kept($session, $digest, $input)) {
+        return true;
     }
 
+    $notes = hive_prompt_wake_allowed($digest, $settings['wakes_per_hour']);
     $said = hive_broker_said($digest);
     foreach (hive_prompt_messages($session, $digest, true) as $message) {
-        if (isset($said[$message['message']])) {
+        $claim = is_array($message['params'] ?? null) && ($message['params']['kind'] ?? null) === HIVE_BOARD_POINTER_KIND;
+        if (isset($said[$message['message']]) || (! $claim && ! $notes)) {
             continue;
         }
-        $line = hive_prompt_line($message, $digest, $settings, $input, 'wake');
+        $line = hive_prompt_line($message, $digest, $settings, $input, 'wake', $session);
         if ($line === null) {
             continue;
         }
@@ -53050,6 +53162,8 @@ function hive_prompt_watch_say(array $session, string $digest, array $input): bo
         $wakes = $line === HIVE_PROMPT_POINTER || str_starts_with($line, '<hive-from-your-developer ');
         if ($wakes) {
             fwrite(STDERR, hive_topic_help_text(rtrim($line, "\n"), $digest)."\n");
+        }
+        if ($wakes && ! $claim) {
             hive_prompt_pointers_mutate($digest, static function (array $doc): array {
                 $doc['wakes'][] = time();
 
@@ -53297,6 +53411,578 @@ function hive_doctor_board_prompts(): array
     return ['ok', 'nudges '.($prompts['nudges'] ? 'on' : 'off').', notes '
         .($prompts['text'] ? 'on here' : 'off here (turn them on for this computer on /board -> My access)')
         .', '.($prompts['arm'] ? 'the idle watcher arms for them' : 'the idle watcher does not arm for them')];
+}
+
+// =============================================================================
+// SECTION 34b -- board approvals: a Claim or Take over the developer approved
+// =============================================================================
+//
+// docs/api/board-actions.md, "The client's half". On /board > Superpowers a
+// developer approves one Claim or Take over for one of their own computers,
+// and Hive points one live session there at it: notice.from_developer of
+// kind `claim` (HIVE_BOARD_POINTER_KIND), whose `prompt` is the board
+// action's ulid and nothing else. Hive sends closed fields only -- the act,
+// the ref, the holder, the plan, a takeover's reason -- and every word of
+// the block is this client's own constant. Here:
+//
+//   where       only in an interactive session (never hive_is_headless()),
+//               never in a sub-agent's hook, and only when the session's
+//               base folder is the recorded workspace itself
+//               (hive_board_root()): progress.mjs runs at its root.
+//               Anywhere else it is neither taken nor said; the action
+//               expires on Hive and the board offers the copy prompt
+//   mid-turn    the PostToolBatch flush says HIVE_BOARD_POINTER alone and
+//               keeps the pointer (kind `claim`) for the Stop; it never
+//               takes one (a claim injected mid-turn can derail the agent)
+//   at a Stop   the synchronous Stop takes it (`via: stop`) and answers
+//               decision block with the whole block, before any note
+//               (hive_prompt_deliver(), hive_board_give())
+//   on a wake   the idle watcher takes it (`via: wake`) and wakes the
+//               session with the whole block: from the waits poll, or
+//               from the pointer file when a Stop's take met no answer
+//   every mode  delivered in every permission mode: the words are the
+//               client's and the command is the one the developer
+//               approved. take is told the hook's own mode, which Hive
+//               records and never judges
+//   checks      every field of a take is checked again
+//               (hive_board_taken_shape()); any failure says
+//               HIVE_PROMPT_OFF and nothing else
+//   the owners  the cached policy's broker.board.claims false, and Hive's
+//               403 board_actions_off or switched_off: HIVE_PROMPT_OWNERS_OFF
+//   the opt-out HIVE_BOARD_PROMPTS=0 (hive_prompts_on()): nothing is taken
+//               or said, as for notes
+//
+// The workspace's folder is printed in the block as this computer spells it
+// (hive_board_workspace()); it never comes from Hive and never goes to it.
+//
+// EXISTING FUNCTIONS this section's lane edits: hive_broker_typed()
+// (`prompt_kind` takes HIVE_POINTER_KINDS), hive_prompt_pointer_shape() and
+// hive_prompt_keep() (a pointer's `kind`), hive_prompt_line() (the claim
+// branch), hive_prompt_flush_say() and hive_prompt_watch_say() (pass the
+// session; the watcher gives a kept claim), hive_prompt_deliver() (claims
+// first, every mode, never at a session start).
+// =============================================================================
+
+/*
+| BoardFields' patterns, character for character, and its words: each
+| field's refusal word, the pointer's kind and live activity's `ws`
+| (BoardActionParityTest).
+*/
+const HIVE_BOARD_SAFE_REF = '/\A[A-Za-z0-9][A-Za-z0-9._-]*#[A-Za-z0-9][A-Za-z0-9._-]*\z/';
+const HIVE_BOARD_REF_MAX = 120;
+const HIVE_BOARD_LOGIN = '/\A[A-Za-z0-9][A-Za-z0-9-]{0,38}\z/';
+const HIVE_BOARD_PLAIN_PLAN = '/\A(?=.{4,200}\z)(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*\.md\z/';
+const HIVE_BOARD_REASON = '/\A[A-Za-z0-9 .,:;()\/#@+_?-]{1,200}\z/';
+const HIVE_BOARD_REASON_EDGES = '/\A[ -]| \z/';
+const HIVE_BOARD_REASON_MAX = 200;
+const HIVE_BOARD_POINTER_KIND = 'claim';
+const HIVE_BOARD_WS = ['root', 'inside', 'none'];
+const HIVE_BOARD_REFUSALS = ['ref' => 'unsafe_ref', 'holder' => 'unsafe_ref', 'plan' => 'plan', 'reason' => 'reason'];
+/** The acts a take answers (BoardAct), and take's `via` from a session (BoardActionVia, C1). */
+const HIVE_BOARD_ACTS = ['claim', 'takeover'];
+const HIVE_BOARD_VIAS = ['stop', 'wake'];
+/**
+ * take's own 404 `detail` (ProgressBoardActionsController::WORDS, BoardActionParityTest):
+ * a 404 without it is no answer of take's -- an older Hive mid-rollout has no such route.
+ */
+const HIVE_BOARD_NOT_FOUND_DETAIL = 'No board action of yours for this computer and session matches.';
+/**
+ * The latest second into the synchronous Stop's process at which a take that met no answer is asked
+ * once more at once (hive_board_give()): that second take, then one note's, still end inside the
+ * hook's 15 s timeout.
+ */
+const HIVE_BOARD_STOP_RETRY_BY = 7.0;
+/** What `{workspace}` prints: the recorded workspace as this computer spells it, when it is this plain. */
+const HIVE_BOARD_WORKSPACE_SHAPE = '/\A[A-Za-z0-9 ._\/:~+@()-]{1,240}\z/';
+const HIVE_BOARD_WORKSPACE_FALLBACK = 'the velu-workspace root';
+
+/*
+| The fixed words (docs/api/board-actions.md, "The block's exact bytes"),
+| each line ending in one newline. `{ulid}` is take's action, `{age}` and
+| `{name}` as notes print them, `{at}` the H:i of take's `at`, `{ref}`,
+| `{holder}` and `{reason}` take's own fields, `{plan_sentence}` one of the
+| two plan sentences, `{workspace}` hive_board_workspace()'s.
+*/
+const HIVE_BOARD_POINTER = 'Your developer approved a board action for this session on Hive\'s board. Hive gives it to you when this turn ends; carry on.';
+const HIVE_BOARD_NEXT = '{plan_sentence} Once a repo agent starts on it, the next command is node scripts/progress.mjs start {ref}; later transitions '
+    .'follow "Claim before you build" in docs/workspace/rules/planning.md, and a "republish the superpowers dashboard" line from progress.mjs is '
+    ."the superpowers-dashboard skill's cue.\n";
+const HIVE_BOARD_COVERS = "This approval covers that one command for that one item and nothing else; anything more waits for {name} here in the terminal.\n"
+    ."</hive-from-your-developer>\n";
+const HIVE_BOARD_BLOCK_CLAIM = "<hive-from-your-developer prompt=\"{ulid}\" kind=\"claim\" age=\"{age}\">\n"
+    ."HIVE FROM YOUR DEVELOPER ({age}): {name} approved one board action on Hive's board at {at}, for this session: claiming the "
+    ."superpowers board item {ref}.\n"
+    ."The approved command, from {workspace}: node scripts/progress.mjs claim {ref}\n"
+    .HIVE_BOARD_NEXT
+    .HIVE_BOARD_COVERS;
+const HIVE_BOARD_BLOCK_TAKEOVER = "<hive-from-your-developer prompt=\"{ulid}\" kind=\"claim\" age=\"{age}\">\n"
+    ."HIVE FROM YOUR DEVELOPER ({age}): {name} approved one board action on Hive's board at {at}, for this session: taking over the "
+    ."superpowers board item {ref} from {holder}.\n"
+    ."The approved command, from {workspace}: node scripts/progress.mjs claim {ref} --takeover '{reason}'\n"
+    .HIVE_BOARD_NEXT
+    ."The workspace rules expect {holder} to hear why.\n"
+    .HIVE_BOARD_COVERS;
+const HIVE_BOARD_PLAN = 'Its plan is {plan}.';
+const HIVE_BOARD_NO_PLAN = 'It has no plan file yet.';
+
+// -----------------------------------------------------------------------------
+// The fields, and take
+// -----------------------------------------------------------------------------
+
+/**
+ * BoardFields::problem()'s twin: the refusal word for $value in $field
+ * (HIVE_BOARD_REFUSALS), or null when it may stand there. A null value is
+ * never sound: whether a field is needed at all is the act's. A reason's
+ * last check is hive_prompt_text_problem(), RoomText's twin, as a note to
+ * one's own agent is checked: no link, trusted mark, Hive line word or
+ * credential's shape. A field this client does not know is refused.
+ */
+function hive_board_field_problem(string $field, ?string $value): ?string
+{
+    $word = HIVE_BOARD_REFUSALS[$field] ?? 'unsafe_ref';
+    if ($value === null || ! isset(HIVE_BOARD_REFUSALS[$field])) {
+        return $word;
+    }
+
+    switch ($field) {
+        case 'ref':
+            $sound = strlen($value) <= HIVE_BOARD_REF_MAX && preg_match(HIVE_BOARD_SAFE_REF, $value) === 1;
+            break;
+        case 'holder':
+            $sound = preg_match(HIVE_BOARD_LOGIN, $value) === 1;
+            break;
+        case 'plan':
+            $sound = preg_match(HIVE_BOARD_PLAIN_PLAN, $value) === 1;
+            break;
+        default:
+            $sound = preg_match(HIVE_BOARD_REASON, $value) === 1 && preg_match(HIVE_BOARD_REASON_EDGES, $value) !== 1
+                && hive_prompt_text_problem($value, HIVE_BOARD_REASON_MAX, true) === null;
+    }
+
+    return $sound ? null : $word;
+}
+
+/**
+ * take's 200 as this client can vouch for it, else null
+ * (docs/api/board-actions.md, "Checks"): `object` board_action, `action`
+ * the pointer's own ulid, `act` claim or takeover; `ref` passes its field;
+ * a claim has neither holder nor reason, a takeover's holder and reason
+ * pass theirs; `plan` is null or passes its field; `age_seconds` a whole
+ * number of 0 or more. And no ref, holder or plan may fold into one of the
+ * developer block's trusted marks (hive_trusted_mark_in()), as nothing
+ * else Hive sends may. Keys it does not name are not read. `name` is take's
+ * from as notes print it (hive_prompt_name()), `at` its time as sent.
+ *
+ * @param  array<string, mixed>  $json
+ * @return array{action: string, act: string, ref: string, holder: string|null, plan: string|null, reason: string|null, name: string, at: string, age_seconds: int}|null
+ */
+function hive_board_taken_shape(array $json, string $ulid): ?array
+{
+    $act = $json['act'] ?? null;
+    $age = $json['age_seconds'] ?? null;
+    $fields = [];
+    foreach (['ref', 'holder', 'plan', 'reason'] as $key) {
+        $value = $json[$key] ?? null;
+        if ($value !== null && ! is_string($value)) {
+            return null;
+        }
+        $fields[$key] = $value;
+    }
+    if (($json['object'] ?? null) !== 'board_action' || ! hive_is_ulid($ulid) || ($json['action'] ?? null) !== $ulid
+        || ! is_string($act) || ! in_array($act, HIVE_BOARD_ACTS, true) || ! is_int($age) || $age < 0) {
+        return null;
+    }
+
+    $sound = hive_board_field_problem('ref', $fields['ref']) === null
+        && ($fields['plan'] === null || hive_board_field_problem('plan', $fields['plan']) === null)
+        && ($act === 'claim'
+            ? $fields['holder'] === null && $fields['reason'] === null
+            : hive_board_field_problem('holder', $fields['holder']) === null && hive_board_field_problem('reason', $fields['reason']) === null);
+    foreach (['ref', 'holder', 'plan'] as $key) {
+        $sound = $sound && ($fields[$key] === null || ! hive_trusted_mark_in($fields[$key]));
+    }
+    if (! $sound) {
+        return null;
+    }
+
+    return [
+        'action' => $ulid,
+        'act' => $act,
+        'ref' => (string) $fields['ref'],
+        'holder' => $fields['holder'],
+        'plan' => $fields['plan'],
+        'reason' => $fields['reason'],
+        'name' => hive_prompt_name(is_array($json['from'] ?? null) ? $json['from'] : []),
+        'at' => is_string($json['at'] ?? null) ? $json['at'] : '',
+        'age_seconds' => $age,
+    ];
+}
+
+/**
+ * POST /progress/board-actions/{action}/take (docs/api/board-actions.md),
+ * for the session $digest names, with `via` and the delivering hook's own
+ * mode. Null when Hive gave no answer -- no token, the machine's hold, a
+ * timeout, a 5xx, a 429, a dry run, or a 404 that is not take's own
+ * not_found (HIVE_BOARD_NOT_FOUND_DETAIL): during a rolling deploy an older
+ * Hive answers this route 404 "No such resource.", and dropping the
+ * pointer then would lose the claim -- and nothing is decided. Otherwise the
+ * status, the problem's `code`, and for a 200 the answer, field by field
+ * (hive_board_taken_shape(): null when this client cannot vouch for it).
+ * The body carries no word, and no answer is ever logged
+ * (hive_audit_write() keeps a progress route's body by its size).
+ *
+ * $unanswered is set true when the take went out and came back with
+ * nothing that decides -- a timeout, a 5xx, a foreign 404 -- so it may
+ * have committed on Hive all the same: asked again within
+ * board_actions.retake_seconds it is answered again. Never for a 429 or
+ * for a take that was never sent.
+ *
+ * @return array{status: int, code: string|null, taken: array{action: string, act: string, ref: string, holder: string|null, plan: string|null, reason: string|null, name: string, at: string, age_seconds: int}|null}|null
+ */
+function hive_board_take(string $ulid, string $digest, string $via, string $mode, bool &$unanswered = false): ?array
+{
+    $unanswered = false;
+    if (! hive_is_ulid($ulid) || ! hive_is_hash($digest) || ! in_array($via, HIVE_BOARD_VIAS, true)
+        || hive_token() === null || ! hive_broker_may_send()) {
+        return null;
+    }
+
+    $mode = in_array($mode, HIVE_PERMISSION_MODES, true) || $mode === 'other' ? $mode : 'unknown';
+    $result = hive_http('POST', '/progress/board-actions/'.$ulid.'/take', ['client_session' => $digest, 'via' => $via, 'mode' => $mode],
+        'flush', [], microtime(true) + HIVE_PROMPT_TAKE_SECONDS);
+    $status = (int) ($result['status'] ?? 0);
+    if ($status === 0 || $status === 429 || $status >= 500) {
+        // Sent and not answered; never a 429, a dry run or a hold, which sent nothing.
+        $unanswered = $status >= 500 || ($status === 0 && ! in_array($result['error'] ?? null, ['insecure-url', 'dry-run', 'circuit-open'], true));
+
+        return null;
+    }
+
+    $json = is_array($result['json'] ?? null) ? $result['json'] : [];
+    if ($status === 404 && (($json['code'] ?? null) !== 'not_found' || ($json['detail'] ?? null) !== HIVE_BOARD_NOT_FOUND_DETAIL)) {
+        $unanswered = true;
+
+        return null;
+    }
+
+    return [
+        'status' => $status,
+        'code' => is_string($json['code'] ?? null) ? $json['code'] : null,
+        'taken' => $status === 200 ? hive_board_taken_shape($json, $ulid) : null,
+    ];
+}
+
+// -----------------------------------------------------------------------------
+// Where, and the block
+// -----------------------------------------------------------------------------
+
+/**
+ * The recorded workspace this session's base folder is, as this computer
+ * spells it (hive_progress_known_as(): progress_workspace, the adopt
+ * window's spellings, a folder with progress state here, through any link
+ * realpath() resolves), or null: the one place a claim is taken and said.
+ * The session's base alone decides, never the hook's cwd, which follows the
+ * agent's cd. A base inside the workspace (a clone in it) is not its root.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_board_root(array $session): ?string
+{
+    $base = hive_session_base($session);
+    if ($base === null || trim($base) === '') {
+        return null;
+    }
+    $known = hive_progress_known_as(hive_normalise_slashes($base));
+
+    return $known === null ? null : hive_normalise_slashes($known);
+}
+
+/**
+ * Live activity's `ws` for this session (HIVE_BOARD_WS,
+ * docs/api/board-actions.md "Live activity"): `root` when its base folder
+ * is the recorded workspace itself (hive_board_root(), the same gate a
+ * claim is taken at), `inside` when it is under it -- a clone in it --
+ * and `none` otherwise or with no base. A word, never a path: Hive never
+ * learns the folder.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_board_ws(array $session): string
+{
+    $base = hive_session_base($session);
+    if ($base === null || trim($base) === '') {
+        return 'none';
+    }
+    if (hive_board_root($session) !== null) {
+        return 'root';
+    }
+
+    $here = hive_progress_spellings($base);
+    foreach (hive_progress_recorded() as [$spelling]) {
+        foreach (hive_progress_spellings($spelling) as $dir) {
+            foreach ($here as $path) {
+                if (hive_path_within($dir, $path)) {
+                    return 'inside';
+                }
+            }
+        }
+    }
+
+    return 'none';
+}
+
+/**
+ * The idle watcher's mark that its session is at the workspace root
+ * (<home>/progress/<digest>.watch.root), written when it takes its watch
+ * lock and removed when it is not, for the waits poll's `watching_root=`
+ * (hive_prompt_watching_root()). Only where this computer takes claims:
+ * not with HIVE_BOARD_PROMPTS=0, not headless. An empty file: no path in it.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_board_watch_mark(string $digest, array $session): void
+{
+    if (! hive_is_hash($digest)) {
+        return;
+    }
+    $marker = hive_waits_file($digest.'.watch.root');
+    if (hive_prompts_on() && ! hive_is_headless() && hive_board_root($session) !== null) {
+        @touch($marker);
+    } elseif (is_file($marker)) {
+        @unlink($marker);
+    }
+}
+
+/**
+ * Of the live watchers $watching (hive_prompt_watching()), those whose
+ * session is at the workspace root (hive_board_watch_mark()): digests only,
+ * for GET /progress/waits' `watching_root=`.
+ *
+ * @param  list<string>  $watching
+ * @return list<string>
+ */
+function hive_prompt_watching_root(array $watching): array
+{
+    return array_values(array_filter($watching, static fn (string $digest): bool => hive_is_hash($digest)
+        && is_file(hive_waits_file($digest.'.watch.root'))));
+}
+
+/**
+ * Whether the cached policy lets the developer's board actions through:
+ * false only for the broker block's `board.claims` false (the owners'
+ * switch, or the server's). A Hive that sends no board block takes as on,
+ * and take's own answer decides.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_board_claims_on(array $session): bool
+{
+    $broker = hive_policy_value(hive_waits_policy($session), 'broker', null);
+    $board = is_array($broker) && is_array($broker['board'] ?? null) ? $broker['board'] : [];
+
+    return ($board['claims'] ?? null) !== false;
+}
+
+/**
+ * `{workspace}` as the block prints it: the folder as this computer spells
+ * it, forward slashes and all, when it matches HIVE_BOARD_WORKSPACE_SHAPE
+ * and carries no trusted mark; else HIVE_BOARD_WORKSPACE_FALLBACK. It never
+ * comes from Hive and is never sent to it.
+ */
+function hive_board_workspace(string $spelled): string
+{
+    return preg_match(HIVE_BOARD_WORKSPACE_SHAPE, $spelled) === 1 && ! hive_trusted_mark_in($spelled) ? $spelled : HIVE_BOARD_WORKSPACE_FALLBACK;
+}
+
+/**
+ * The block for a take this client vouched for (hive_board_taken_shape()),
+ * exactly as docs/api/board-actions.md writes it, ending in one newline:
+ * HIVE_BOARD_BLOCK_CLAIM or HIVE_BOARD_BLOCK_TAKEOVER, filled from the
+ * take's fields and $workspace (hive_board_workspace()) alone.
+ *
+ * @param  array{action: string, act: string, ref: string, holder: string|null, plan: string|null, reason: string|null, name: string, at: string, age_seconds: int}  $taken
+ */
+function hive_board_block(array $taken, string $workspace): string
+{
+    $at = preg_match('/T(\d{2}):(\d{2})/', $taken['at'], $m) === 1 ? $m[1].':'.$m[2] : date('H:i');
+
+    return strtr($taken['act'] === 'takeover' ? HIVE_BOARD_BLOCK_TAKEOVER : HIVE_BOARD_BLOCK_CLAIM, [
+        '{ulid}' => $taken['action'],
+        '{age}' => hive_prompt_age($taken['age_seconds']),
+        '{name}' => $taken['name'],
+        '{at}' => $at,
+        '{ref}' => $taken['ref'],
+        '{holder}' => (string) $taken['holder'],
+        '{reason}' => (string) $taken['reason'],
+        '{plan_sentence}' => $taken['plan'] === null ? HIVE_BOARD_NO_PLAN : strtr(HIVE_BOARD_PLAN, ['{plan}' => $taken['plan']]),
+        '{workspace}' => hive_board_workspace($workspace),
+    ]);
+}
+
+// -----------------------------------------------------------------------------
+// Saying it
+// -----------------------------------------------------------------------------
+
+/**
+ * What a take of the board action $ulid gives this session, for a session
+ * at the workspace $root:
+ *
+ *   null   Hive gave no answer, or 409 not_now: nothing is decided, and
+ *          the caller keeps the pointer to try again (HIVE_PROMPT_RETRY);
+ *          $unanswered as hive_board_take() set it
+ *   ''     settled with nothing to say: gone, taken, not found, refused
+ *   else   the block (hive_board_block()); HIVE_PROMPT_OWNERS_OFF on 403
+ *          board_actions_off or switched_off; HIVE_PROMPT_OFF for a 200
+ *          this client cannot vouch for, and nothing else of it
+ *
+ * @param  array<string, string>  $input  the delivering hook's own input
+ */
+function hive_board_answer(string $ulid, string $digest, string $via, array $input, string $root, bool &$unanswered = false): ?string
+{
+    $answer = hive_board_take($ulid, $digest, $via, hive_prompt_mode($input), $unanswered);
+    if ($answer === null || hive_prompt_not_now($answer)) {
+        return null;
+    }
+    if ($answer['status'] === 403 && in_array($answer['code'], ['board_actions_off', 'switched_off'], true)) {
+        return HIVE_PROMPT_OWNERS_OFF;
+    }
+    if ($answer['status'] !== 200) {
+        return '';
+    }
+
+    return $answer['taken'] === null ? HIVE_PROMPT_OFF : hive_board_block($answer['taken'], $root);
+}
+
+/**
+ * hive_prompt_line()'s claim branch, for the message $message pointing at
+ * the board action $prompt: null, and the message stays unsaid, in a
+ * session not at the workspace root, or when a wake's take met no answer
+ * (tried again after HIVE_PROMPT_RETRY); the owners' off line while the
+ * cached policy has claims off; from the async flush ($via `stop`) the
+ * pointer line alone, the pointer kept for the synchronous Stop; from the
+ * idle watcher ($via `wake`) what its take gives (hive_board_answer()).
+ *
+ * @param  array<string, mixed>  $session
+ * @param  array<string, string>  $input
+ */
+function hive_board_line(string $prompt, string $message, string $digest, array $session, array $input, string $via): ?string
+{
+    $root = hive_board_root($session);
+    if ($root === null) {
+        return null;
+    }
+    if (! hive_board_claims_on($session)) {
+        return HIVE_PROMPT_OWNERS_OFF;
+    }
+    if ($via !== 'wake') {
+        return hive_prompt_keep($digest, $prompt, $message, 'stop', HIVE_BOARD_POINTER_KIND) ? HIVE_BOARD_POINTER : null;
+    }
+    if (isset(hive_prompt_pending($digest)['tried'][$prompt])) {
+        return null;
+    }
+
+    $said = hive_board_answer($prompt, $digest, 'wake', $input, $root);
+    if ($said === null) {
+        hive_prompt_tried($digest, $prompt);
+    }
+
+    return $said;
+}
+
+/**
+ * What a claim pointer the session keeps gives, at the synchronous Stop
+ * ($via `stop`) or from the idle watcher (`wake`). The pointer is taken out
+ * of the file under its lock first, so of the Stop and a watcher that start
+ * together exactly one gives it:
+ *
+ *   null   nothing now: a sub-agent's or a headless hook, or Hive gave no
+ *          answer (the pointer put back, tried again after
+ *          HIVE_PROMPT_RETRY). The synchronous Stop asks once more at once
+ *          first, while its process is under HIVE_BOARD_STOP_RETRY_BY
+ *          seconds old: a take that committed on Hive past this client's
+ *          deadline is then answered again within retake_seconds, where
+ *          the watcher's try a minute or more later might meet 409
+ *          action_taken while the board says Delivered
+ *   ''     nothing to say, the pointer gone: given elsewhere already, a
+ *          session no longer at the workspace root, or settled
+ *   else   what to say, the pointer gone: the block, or an off line
+ *
+ * @param  array<string, mixed>  $session
+ * @param  array<string, string>  $input
+ */
+function hive_board_give(string $digest, string $prompt, string $via, array $session, array $input): ?string
+{
+    if (hive_prompt_in_subagent($input) || hive_is_headless()) {
+        return null;
+    }
+
+    $pointer = null;
+    hive_prompt_pointers_mutate($digest, static function (array $doc) use ($prompt, &$pointer): array {
+        $kept = $doc['prompts'][$prompt] ?? null;
+        if ($kept !== null && $kept['kind'] === HIVE_BOARD_POINTER_KIND && ! isset($doc['tried'][$prompt])) {
+            $pointer = $kept;
+            unset($doc['prompts'][$prompt]);
+        }
+
+        return $doc;
+    });
+    if ($pointer === null) {
+        return '';
+    }
+
+    $root = hive_board_root($session);
+    if ($root === null) {
+        return '';
+    }
+    if (! hive_board_claims_on($session)) {
+        return HIVE_PROMPT_OWNERS_OFF;
+    }
+
+    $unanswered = false;
+    $said = hive_board_answer($prompt, $digest, $via, $input, $root, $unanswered);
+    $started = (float) ($_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true));
+    if ($said === null && $unanswered && $via === 'stop' && microtime(true) - $started <= HIVE_BOARD_STOP_RETRY_BY) {
+        $said = hive_board_answer($prompt, $digest, $via, $input, $root);
+    }
+    if ($said === null) {
+        hive_prompt_pointers_mutate($digest, static function (array $doc) use ($prompt, $pointer): array {
+            $doc['prompts'][$prompt] = $pointer;
+            $doc['tried'][$prompt] = time();
+
+            return $doc;
+        });
+    }
+
+    return $said;
+}
+
+/**
+ * The idle watcher's part for claims its session keeps (hive_prompt_watch_say()):
+ * the first one not tried within HIVE_PROMPT_RETRY, given as a wake. Its
+ * block on stderr, and true, when it wakes the session; an off line or
+ * nothing settles it without a wake. A claim's own allowance: never held
+ * by nor counted in prompts.wakes_per_hour (hive_prompt_watch_say()).
+ *
+ * @param  array<string, mixed>  $session
+ * @param  array<string, string>  $input
+ */
+function hive_board_watch_kept(array $session, string $digest, array $input): bool
+{
+    $pending = hive_prompt_pending($digest);
+    foreach ($pending['prompts'] as $prompt => $pointer) {
+        if ($pointer['kind'] !== HIVE_BOARD_POINTER_KIND || isset($pending['tried'][(string) $prompt])) {
+            continue;
+        }
+        $line = hive_board_give($digest, (string) $prompt, 'wake', $session, $input);
+        if ($line === null || ! str_starts_with($line, '<hive-from-your-developer ')) {
+            continue;
+        }
+        fwrite(STDERR, hive_topic_help_text(rtrim($line, "\n"), $digest)."\n");
+
+        return true;
+    }
+
+    return false;
 }
 
 // =============================================================================
