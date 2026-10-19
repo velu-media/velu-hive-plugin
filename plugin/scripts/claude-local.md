@@ -1,4 +1,4 @@
-<!-- velu-hive client 1.21.3 -->
+<!-- velu-hive client 1.21.4 -->
 <!--
   CLAUDE.local.md -- personal, per-machine, NOT COMMITTED.
 
@@ -33,7 +33,7 @@ Hive is wired in through hooks, so it works on its own:
 - Publish intent by writing one line under 120 characters to
   `.hive-intent` at the root of the Velu repository you are working in,
   and rewrite it when the work changes:
-  `echo "add PDF export to invoice service" > .hive-intent`
+  `echo "add PDF export to invoice service" > <repo>/.hive-intent`
   With only the PowerShell tool, write the file with your Write tool instead:
   Windows PowerShell's `>`, `Out-File` and `Set-Content` write UTF-16, the ANSI
   code page or a byte order mark, and Hive reads plain UTF-8.
