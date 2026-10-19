@@ -388,7 +388,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.21.2';
+const HIVE_VERSION = '1.21.3';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -447,6 +447,12 @@ const HIVE_TIMEOUTS = [
     // same. One that fails is said again by the flush's heartbeat or its
     // last act.
     'state-first' => [600, 200],
+    // A plan document over 256 KB on a detached path (the `plan-file` run, its
+    // spool retry, the workspace sync) or inside a push's own deadline:
+    // hive_plan_upload_window() holds the request to 3 s and 1 s per started
+    // 256 KB, at most this pair's 15 s, and never past the run's own deadline.
+    // Its upload is most of it: a 2 MiB plan takes 3.4 s at 5 Mbit/s.
+    'plan-upload' => [800, 14200],
 ];
 
 /*
@@ -1669,9 +1675,14 @@ const HIVE_SLICE_DATA_NOTE = 'Slice titles and teammates\' names come from Hive:
 |                       velu-hive (hive.workplans.plan_globs)
 |   PLAN_FILE_EXCEPT    base names never read among them: a design doc, a
 |                       README, an index (hive.workplans.plan_except)
-|   PLAN_DOC_MAX        the largest document read or sent, whole or not at
-|                       all (doc_max_bytes; the policy's
-|                       workplans.doc_max_bytes, no higher than this)
+|   PLAN_DOC_MAX        the largest document ever read or sent, whole or not
+|                       at all: 2 MiB, the server's doc_max_bytes. The
+|                       policy's workplans.doc_max_bytes sets the limit,
+|                       held to 1 KB to this (hive_plan_doc_max())
+|   PLAN_DOC_FALLBACK   the limit while the cache names none (no policy yet,
+|                       a server older than 1.11.0's): 64 KB, what every
+|                       client up to 1.21.2 sent, so a machine that has not
+|                       heard the owners' value never sends more than that
 |   PLAN_FILE_DEBOUNCE  seconds a written plan file waits for its run, per file
 |   PLAN_SYNC_EVERY     seconds between two syncs of one workspace's
 |                       PROGRESS.md files (the policy's
@@ -1691,6 +1702,11 @@ const HIVE_SLICE_DATA_NOTE = 'Slice titles and teammates\' names come from Hive:
 |                       velu-workspace holds about 70 PROGRESS.md, and ten
 |                       captures back to back drew a 429 that held the whole
 |                       machine (hunt 7, H2). The rest go at the next run
+|   PLAN_UPLOAD_STEP, PLAN_UPLOAD_BASE, PLAN_UPLOAD_MAX   the window a plan
+|                       document over one step (256 KB) gets on a detached
+|                       path: BASE seconds and one more per started step, at
+|                       most MAX (hive_plan_upload_window(); HIVE_TIMEOUTS'
+|                       plan-upload). A smaller one keeps the progress pair
 |
 |   AUTONOMY_VALUES, GATE_MODES   the broker's switches (policy broker.*)
 |   BROKER_KINDS, BROKER_CODES, BROKER_SIDES, BROKER_UNTIL, BROKER_RULES,
@@ -1767,7 +1783,8 @@ const HIVE_SLICE_DATA_NOTE = 'Slice titles and teammates\' names come from Hive:
 */
 const HIVE_PLAN_FILE_GLOBS = ['docs/superpowers/**/*.md', 'docs/plans/**/*.md', '**/PROGRESS.md'];
 const HIVE_PLAN_FILE_EXCEPT = ['*-design.md', 'README.md', 'INDEX.md'];
-const HIVE_PLAN_DOC_MAX = 65536;
+const HIVE_PLAN_DOC_MAX = 2097152;
+const HIVE_PLAN_DOC_FALLBACK = 65536;
 const HIVE_PLAN_FILE_DEBOUNCE = 15;
 const HIVE_PLAN_SYNC_EVERY = 600;
 const HIVE_PLAN_SYNC_ROOT = 'docs/superpowers';
@@ -1776,6 +1793,9 @@ const HIVE_PLAN_WANTS_MAX = 20;
 const HIVE_PLAN_SYNC_COST_PER_MINUTE = 120;
 const HIVE_PLAN_SYNC_CAPTURE_COST = 5;
 const HIVE_PLAN_SYNC_MINUTE_SHARE = 5;
+const HIVE_PLAN_UPLOAD_STEP = 262144;
+const HIVE_PLAN_UPLOAD_BASE = 3;
+const HIVE_PLAN_UPLOAD_MAX = 15;
 
 const HIVE_AUTONOMY_VALUES = ['off', 'suggest', 'auto'];
 const HIVE_GATE_MODES = ['context', 'deny'];
@@ -24994,8 +25014,10 @@ function hive_progress_text_problem(string $value, bool $allowNewlines = false):
         return 'invalid_utf8';
     }
 
+    // Each check below fails closed: a match PCRE could not finish (false)
+    // is a problem, never a pass.
     $checked = $allowNewlines ? str_replace(["\n", "\t"], '', $value) : $value;
-    if (preg_match('/[\p{Cc}\x{2028}\x{2029}]/u', $checked) === 1) {
+    if (preg_match('/[\p{Cc}\x{2028}\x{2029}]/u', $checked) !== 0) {
         return 'control_character';
     }
 
@@ -25013,18 +25035,18 @@ function hive_progress_text_problem(string $value, bool $allowNewlines = false):
             $value,
         ) ?? $value;
     }
-    if (preg_match('/\p{Cf}/u', $unjoined) === 1) {
+    if (preg_match('/\p{Cf}/u', $unjoined) !== 0) {
         return 'format_character';
     }
 
-    if (preg_match('/[\x{115F}\x{1160}\x{3164}\x{FFA0}\x{2800}\x{E0100}-\x{E01EF}]/u', $value) === 1
-        || preg_match('/(?:^|[\s\x{FE00}-\x{FE0F}])[\x{FE00}-\x{FE0F}]/u', $value) === 1) {
+    if (preg_match('/[\x{115F}\x{1160}\x{3164}\x{FFA0}\x{2800}\x{E0100}-\x{E01EF}]/u', $value) !== 0
+        || preg_match('/(?:^|[\s\x{FE00}-\x{FE0F}])[\x{FE00}-\x{FE0F}]/u', $value) !== 0) {
         return 'invisible_character';
     }
 
     if (! $allowNewlines) {
         $openers = '\x{FF1C}\x{FE64}\x{3008}\x{2329}\x{27E8}\x{27EA}\x{2039}\x{276C}\x{276E}\x{2770}\x{29FC}\x{02C2}\x{1438}';
-        if (preg_match('/<\s*[\/\\\\!?]|(?<![\p{L}\p{N}_])<\p{L}|['.$openers.']\s*[\p{L}\/\\\\!?]/u', $value) === 1) {
+        if (preg_match('/<\s*[\/\\\\!?]|(?<![\p{L}\p{N}_])<\p{L}|['.$openers.']\s*[\p{L}\/\\\\!?]/u', $value) !== 0) {
             return 'angle_bracket';
         }
     }
@@ -25035,12 +25057,15 @@ function hive_progress_text_problem(string $value, bool $allowNewlines = false):
 /**
  * Does this text hold something shaped like a credential?
  * HIVE_PROGRESS_SECRET_PATTERNS, which are ProgressFile::SECRET_PATTERNS
- * character for character (a test holds the two together).
+ * character for character (a test holds the two together). A pattern PCRE
+ * could not finish (false: its backtracking or JIT stack ran out) counts as
+ * a match: a line of `-----BEGIN ` and a million capitals in a 2 MiB plan
+ * hid the real key after it (planmax fix round, 19 Oct 2026).
  */
 function hive_progress_looks_secret(string $text): bool
 {
     foreach (HIVE_PROGRESS_SECRET_PATTERNS as $pattern) {
-        if (preg_match($pattern, $text) === 1) {
+        if (preg_match($pattern, $text) !== 0) {
             return true;
         }
     }
@@ -43062,7 +43087,7 @@ function hive_override_active(string $case): bool
 //      the detached `plan-file` run (hive_spawn_background()), debounced
 //      HIVE_PLAN_FILE_DEBOUNCE seconds per file. That run checks every path
 //      component with lstat (a regular file, no symbolic link on the way),
-//      the size (HIVE_PLAN_DOC_MAX or the policy's, whole or nothing), UTF-8
+//      the size (the policy's, at most HIVE_PLAN_DOC_MAX; whole or nothing), UTF-8
 //      and a plan marker; withholds the whole document on a credential,
 //      control, bidi or zero-width shape (one HIVE NOTE instead); works out
 //      the blob (git hash-object) and whether the upstream holds it (git
@@ -43207,11 +43232,17 @@ function hive_plan_capture_on(?array $cache): bool
     return is_array($block) && ($block['capture_files'] ?? false) === true;
 }
 
-/** The largest document the owner's policy lets this machine send, no larger than HIVE_PLAN_DOC_MAX. */
+/**
+ * The largest document the owners' policy lets this machine send: its
+ * workplans.doc_max_bytes, held to 1 KB to HIVE_PLAN_DOC_MAX, or
+ * HIVE_PLAN_DOC_FALLBACK while $cache names none as a whole number.
+ *
+ * @param  array<string, mixed>|null  $cache
+ */
 function hive_plan_doc_max(?array $cache): int
 {
     $block = hive_policy_value($cache, 'workplans', null);
-    $max = is_array($block) && is_int($block['doc_max_bytes'] ?? null) ? $block['doc_max_bytes'] : HIVE_PLAN_DOC_MAX;
+    $max = is_array($block) && is_int($block['doc_max_bytes'] ?? null) ? $block['doc_max_bytes'] : HIVE_PLAN_DOC_FALLBACK;
 
     return max(1024, min(HIVE_PLAN_DOC_MAX, $max));
 }
@@ -43417,8 +43448,11 @@ function hive_verb_plan_file(array $args): int
         });
 
         // Hive answered: what an earlier run left in the spool goes too.
-        if (hive_plan_file_capture($digest, $root, $relative, $slug) !== null) {
-            hive_plan_spool_retry(2, microtime(true) + 6.0);
+        // Detached, so a large plan gets its upload window (Task 1 of the
+        // 19 Oct plan), each part within HIVE_PLAN_UPLOAD_MAX.
+        $why = null;
+        if (hive_plan_file_capture($digest, $root, $relative, $slug, $why, null, microtime(true) + HIVE_PLAN_UPLOAD_MAX) !== null) {
+            hive_plan_spool_retry(2, microtime(true) + HIVE_PLAN_UPLOAD_MAX);
         }
         hive_plan_files_sweep();
     } catch (Throwable $e) {
@@ -43436,11 +43470,13 @@ function hive_verb_plan_file(array $args): int
  * link on its path from the repository root, at most the policy's size,
  * UTF-8, with a plan marker, and nothing withheld. Returns Hive's answer,
  * or null when nothing was sent or Hive was out of reach. The request is
- * over by $deadline (HIVE_PROGRESS_SYNC_BUDGET from now when null).
+ * over by $deadline (HIVE_PROGRESS_SYNC_BUDGET from now when null); a large
+ * plan's by $outer at the latest, when given (hive_plan_capture()).
  *
  * @return array<string, mixed>|null
  */
-function hive_plan_file_capture(string $digest, string $root, string $relative, string $slug, ?string &$why = null, ?float $deadline = null): ?array
+function hive_plan_file_capture(string $digest, string $root, string $relative, string $slug, ?string &$why = null, ?float $deadline = null,
+    ?float $outer = null): ?array
 {
     $why = null;
     $cache = hive_cache_load($slug) ?? hive_policy_cache_any();
@@ -43459,7 +43495,7 @@ function hive_plan_file_capture(string $digest, string $root, string $relative, 
         // A link on the way, a folder, a file gone: nothing to say, nothing sent.
         $why = $read['problem'];
 
-        return $read['problem'] === 'too_large' ? hive_plan_file_said($digest, $source, hive_plan_withheld_line($label, 'too_large'), null) : null;
+        return $read['problem'] === 'too_large' ? hive_plan_file_said($digest, $source, hive_plan_withheld_line($label, 'too_large', $max), null) : null;
     }
 
     // Git keeps LF: a CRLF working tree is sent as the blob git stores.
@@ -43469,7 +43505,7 @@ function hive_plan_file_capture(string $digest, string $root, string $relative, 
         $why = $problem;
         hive_progress_log('plan_file', ['sent' => 0, 'withheld' => $problem === 'no_marker' ? 0 : 1]);
 
-        return $problem === 'no_marker' ? null : hive_plan_file_said($digest, $source, hive_plan_withheld_line($label, $problem), null);
+        return $problem === 'no_marker' ? null : hive_plan_file_said($digest, $source, hive_plan_withheld_line($label, $problem, $max), null);
     }
 
     $blob = sha1('blob '.strlen($text)."\0".$text);
@@ -43482,7 +43518,7 @@ function hive_plan_file_capture(string $digest, string $root, string $relative, 
         'upstream' => hive_plan_upstream($root, $relative),
         'commit' => null,
         'client_session' => $digest,
-    ], $deadline ?? microtime(true) + HIVE_PROGRESS_SYNC_BUDGET);
+    ], $deadline ?? microtime(true) + HIVE_PROGRESS_SYNC_BUDGET, $outer);
     unset($text, $read);
     hive_progress_log('plan_file', ['sent' => $answer !== null ? 1 : 0, 'withheld' => 0]);
     if ($answer === null) {
@@ -43498,7 +43534,7 @@ function hive_plan_file_capture(string $digest, string $root, string $relative, 
         $key = is_string($answer['workplan']['key'] ?? null) && hive_is_workplan_key($answer['workplan']['key']) ? $answer['workplan']['key'] : null;
         $line = hive_plan_capture_line($answer, hive_self_command());
     } else {
-        $line = hive_plan_refusal_line($answer, $label);
+        $line = hive_plan_refusal_line($answer, $label, $max);
     }
 
     hive_plan_files_mutate($digest, static function (array $files) use ($source, $state, $key, $blob, $line): array {
@@ -43673,13 +43709,42 @@ function hive_plan_upstream(string $root, string $relative): ?array
     return ['ref' => $ref, 'blob' => hive_is_sha($blob) ? $blob : null];
 }
 
-function hive_plan_capture(string $source, array $document, float $deadline): ?array
+/**
+ * The seconds a plan document of $bytes may take to reach Hive and be
+ * answered, connection and upload included: HIVE_PLAN_UPLOAD_BASE and one
+ * more per started HIVE_PLAN_UPLOAD_STEP, at most HIVE_PLAN_UPLOAD_MAX. Null
+ * for a document of one step or less, which keeps the progress pair (3.0 to
+ * 3.8 s): a second per 256 KB carries about 2 Mbit/s, and a 2 MiB plan takes
+ * 3.4 s to upload at 5 Mbit/s, past the 3.8 s every other request has.
+ */
+function hive_plan_upload_window(int $bytes): ?float
+{
+    if ($bytes <= HIVE_PLAN_UPLOAD_STEP) {
+        return null;
+    }
+
+    return (float) min(HIVE_PLAN_UPLOAD_MAX, HIVE_PLAN_UPLOAD_BASE + intdiv($bytes + HIVE_PLAN_UPLOAD_STEP - 1, HIVE_PLAN_UPLOAD_STEP));
+}
+
+/**
+ * One plan document as PUT /progress/workplans/{source}, spooled first:
+ * Hive's answer, or null when it gave none (the spool keeps the document).
+ * The request is over by $deadline. A document over HIVE_PLAN_UPLOAD_STEP
+ * gets hive_plan_upload_window() instead when the caller passes $outer, its
+ * run's own deadline, which the window never passes: the detached paths and
+ * the pushes pass it, the re-check after a Bash call (a hook's budget) never.
+ *
+ * @param  array<string, mixed>  $document
+ * @return array<string, mixed>|null
+ */
+function hive_plan_capture(string $source, array $document, float $deadline, ?float $outer = null): ?array
 {
     if (! hive_is_hash($source) || ! is_string($document['text'] ?? null)) {
         return null;
     }
     $kind = hive_enum($document['kind'] ?? null, ['file', 'sync', 'stdin'], 'stdin');
     $text = $document['text'];
+    $window = $outer !== null ? hive_plan_upload_window(strlen($text)) : null;
     $repo = is_string($document['repo'] ?? null) && hive_is_repo_name($document['repo']) ? $document['repo'] : null;
     $body = ['kind' => $kind, 'repo' => $repo];
     if ($kind !== 'stdin') {
@@ -43706,7 +43771,16 @@ function hive_plan_capture(string $source, array $document, float $deadline): ?a
     hive_write_json($spool, ['v' => 1, 'source' => $source, 'at' => time(), 'body' => $body]);
     unset($text, $document);
 
-    $result = hive_http('PUT', '/progress/workplans/'.$source, $body, 'progress', [], $deadline);
+    $profile = 'progress';
+    if ($window !== null && $outer !== null) {
+        $profile = 'plan-upload';
+        $deadline = min($outer, microtime(true) + $window);
+    }
+    // No `Expect: 100-continue`: curl asks for one on a body over 1 MiB (on
+    // smaller ones, older curl) and waits up to a second for the answer
+    // before it sends the body at all; measured, the whole of a 1.45 MB
+    // plan's second on a local Hive. The socket fallback never asks.
+    $result = hive_http('PUT', '/progress/workplans/'.$source, $body, $profile, function_exists('curl_init') ? ['Expect' => ''] : [], $deadline);
     unset($body);
     $status = (int) $result['status'];
     if (! ($status >= 200 && $status < 300) && ! ($status >= 400 && $status < 500 && $status !== 408 && $status !== 429)) {
@@ -43719,7 +43793,9 @@ function hive_plan_capture(string $source, array $document, float $deadline): ?a
 
 /**
  * Send what the spool still holds from a run Hive did not answer: at most
- * $max documents; one older than a day is dropped unsent.
+ * $max documents, each within HIVE_PROGRESS_WRITE_BUDGET, or its upload
+ * window when it is large, and none past $deadline; one older than a day is
+ * dropped unsent.
  */
 function hive_plan_spool_retry(int $max, float $deadline): void
 {
@@ -43737,7 +43813,7 @@ function hive_plan_spool_retry(int $max, float $deadline): void
             break;
         }
         $sent++;
-        hive_plan_capture($source, $body, min($deadline, microtime(true) + HIVE_PROGRESS_WRITE_BUDGET));
+        hive_plan_capture($source, $body, min($deadline, microtime(true) + HIVE_PROGRESS_WRITE_BUDGET), $deadline);
     }
 }
 
@@ -43843,15 +43919,35 @@ function hive_plan_problem_words(array $problems): array
 }
 
 /**
- * The HIVE NOTE for a plan the client did not send (rule 3a), by its
- * problem: too_large, not_utf8 or withheld.
+ * A limit of $bytes in a note's words: whole KB under a megabyte, else MB
+ * to a tenth with no .0 (64 KB, 1.5 MB, 2 MB). Rounded down, so a note that
+ * says a document is over it is never untrue.
  */
-function hive_plan_withheld_line(string $label, string $problem): string
+function hive_plan_size_words(int $bytes): string
+{
+    if ($bytes < 1024) {
+        return max(0, $bytes).' bytes';
+    }
+    if ($bytes < 1048576) {
+        return intdiv($bytes, 1024).' KB';
+    }
+    $tenths = intdiv($bytes * 10, 1048576);
+
+    return intdiv($tenths, 10).($tenths % 10 !== 0 ? '.'.($tenths % 10) : '').' MB';
+}
+
+/**
+ * The HIVE NOTE for a plan the client did not send (rule 3a), by its
+ * problem: too_large, not_utf8 or withheld. $max is the limit the client
+ * held it to (hive_plan_doc_max()).
+ */
+function hive_plan_withheld_line(string $label, string $problem, int $max): string
 {
     $label = hive_safe_text($label, HIVE_SAFE_PATH_MAX);
     switch ($problem) {
         case 'too_large':
-            return 'HIVE NOTE: '.$label.' was not sent to Hive: it is over 64 KB, and Hive reads a plan whole or not at all. Split it into smaller plans.';
+            return 'HIVE NOTE: '.$label.' was not sent to Hive: it is over '.hive_plan_size_words($max).', and Hive reads a plan whole or not at all. '
+                .'Split it into smaller plans.';
         case 'not_utf8':
             return 'HIVE NOTE: '.$label.' was not sent to Hive: it is not UTF-8 text. Save it as UTF-8.';
         default:
@@ -43862,11 +43958,14 @@ function hive_plan_withheld_line(string $label, string $problem): string
 
 /**
  * The HIVE NOTE for a document Hive refused whole (422 workplan_refused),
- * from the problem's code and refs only; null for any other answer.
+ * from the problem's code and refs only; null for any other answer. $max
+ * is the limit the policy this computer holds names (hive_plan_doc_max()),
+ * which is Hive's own; a plan's task limit is Hive's max_tasks, 100, and a
+ * PROGRESS.md board's is the owners' board_max_tasks, never named here.
  *
  * @param  array<string, mixed>  $answer
  */
-function hive_plan_refusal_line(array $answer, string $label): ?string
+function hive_plan_refusal_line(array $answer, string $label, int $max): ?string
 {
     if (($answer['code'] ?? null) !== 'workplan_refused') {
         return null;
@@ -43887,13 +43986,16 @@ function hive_plan_refusal_line(array $answer, string $label): ?string
             $why = 'its tasks depend on each other in a loop'.($refs !== [] ? ' ('.implode(' -> ', $refs).')' : '').'. Break the loop.';
             break;
         case 'too_many_tasks':
-            $why = 'it has more than 60 tasks. Split it into smaller plans.';
+            // A PROGRESS.md board's cap is the owners' board_max_tasks, which
+            // no policy names; a plan's is max_tasks, 100.
+            $why = str_ends_with('/'.strtolower($label), '/progress.md') ? 'it has more items than Hive makes one workplan of.'
+                : 'it has more than 100 tasks. Split it into smaller plans.';
             break;
         case 'too_many_repositories':
             $why = 'it names more than 8 repositories. Split it into smaller plans.';
             break;
         case 'too_large':
-            $why = 'it is over 64 KB. Split it into smaller plans.';
+            $why = 'it is over '.hive_plan_size_words($max).'. Split it into smaller plans.';
             break;
         case 'secret_withheld':
             $why = 'it holds something shaped like a credential. Take it out: a plan never holds credentials.';
@@ -43993,10 +44095,21 @@ function hive_workplan_sync(string $workspace, float $deadline): array
     }
     $max = hive_plan_doc_max($cache);
     $key = hive_progress_ctx($ws)['key'];
-    $kept = hive_plan_sync_load()['workspaces'][$key] ?? ['blobs' => [], 'wanted' => []];
+    $kept = hive_plan_sync_load()['workspaces'][$key] ?? ['blobs' => [], 'wanted' => [], 'max' => null];
+    // The limit the kept blobs were judged under. One withheld for its size
+    // under a lower limit is read once more (the rollout trap, 19 Oct 2026):
+    // a file no client named a limit in was written by one that held every
+    // document to 64 KB, as every client up to 1.21.2 did.
+    $judged = $kept['max'] ?? HIVE_PLAN_DOC_FALLBACK;
 
     // One listing: every blob under docs/superpowers, with its size.
-    $listed = hive_workplan_ls_tree($ws, $remote['full'], [HIVE_PLAN_SYNC_ROOT]);
+    $listedOk = null;
+    $listed = hive_workplan_ls_tree($ws, $remote['full'], [HIVE_PLAN_SYNC_ROOT], $listedOk);
+    // The limit is recorded as the one the blobs were judged under only
+    // when the listing answered and named something: one that failed or
+    // ran out of time lists nothing, and recording a raised limit then
+    // would hide every document withheld under the old one for good.
+    $judgedNow = $listedOk === true && $listed !== [];
     $candidates = [];
     foreach ($listed as $path => $blob) {
         $source = hive_plan_source_key($repo, $path);
@@ -44020,11 +44133,14 @@ function hive_workplan_sync(string $workspace, float $deadline): array
     }
 
     $changed = [];
+    $again = [];
     foreach ($candidates as $source => $entry) {
-        if (($kept['blobs'][$source] ?? null) === $entry['blob']) {
+        $grown = $entry['size'] > $judged && $entry['size'] <= $max;
+        if (($kept['blobs'][$source] ?? null) === $entry['blob'] && ! $grown) {
             $counts['unchanged']++;
         } else {
             $changed[$source] = $entry;
+            $again[$source] = $grown;
         }
     }
 
@@ -44071,10 +44187,21 @@ function hive_workplan_sync(string $workspace, float $deadline): array
         $counts['wanted'] = max(0, $counts['wanted'] - ($counts['later'] - $laterBefore));
     }
 
-    hive_plan_sync_mutate(static function (array $sync) use ($key, $done, $wanted, $remote): array {
-        $entry = $sync['workspaces'][$key] ?? ['blobs' => [], 'wanted' => []];
+    hive_plan_sync_mutate(static function (array $sync) use ($key, $done, $wanted, $remote, $again, $max, $judgedNow): array {
+        $entry = $sync['workspaces'][$key] ?? ['blobs' => [], 'wanted' => [], 'max' => null];
         foreach ($done as $source => $blob) {
             $entry['blobs'][$source] = $blob;
+        }
+        // Judged under $max from now on: one read again but not done this
+        // run (the cap left it for later, Hive did not take it) is no longer
+        // kept as done, so the next run reads it as never sent.
+        foreach ($again as $source => $grown) {
+            if ($grown && ! isset($done[$source])) {
+                unset($entry['blobs'][$source]);
+            }
+        }
+        if ($judgedNow) {
+            $entry['max'] = $max;
         }
         $entry['wanted'] = $wanted + $entry['wanted'];
         $entry['synced_at'] = time();
@@ -44152,10 +44279,12 @@ function hive_workplan_sync_send(string $ws, string $repo, array $remote, array 
             continue;
         }
         $left--;
+        // A large document's upload window runs to the run's own deadline at
+        // most: the sync holds the progress lock the agent's verbs wait on.
         $answer = hive_plan_capture($source, [
             'kind' => 'sync', 'repo' => $repo, 'path' => $entry['path'], 'text' => $text, 'blob' => $entry['blob'],
             'upstream' => null, 'commit' => ['sha' => $remote['commit'], 'at' => $remote['at']], 'client_session' => null,
-        ], min($deadline, microtime(true) + HIVE_PROGRESS_WRITE_BUDGET));
+        ], min($deadline, microtime(true) + HIVE_PROGRESS_WRITE_BUDGET), $deadline);
         if ($answer === null) {
             // Hive did not take it: the run stops here, and the rest wait.
             $stopped = hive_class_held($host, 'workplan') > 0 ? 'held' : 'failed';
@@ -44208,17 +44337,20 @@ function hive_workplan_sync_ref(string $ws): ?array
 /**
  * The blobs `git ls-tree -r -l -z` lists under $paths at $ref: path => {blob,
  * size}. At most 5000 entries; a path that is not plain text on one line of
- * UTF-8 is left out.
+ * UTF-8 is left out. $ok says whether git answered: false when it failed or
+ * ran out of time, which lists nothing as an empty folder does.
  *
  * @param  list<string>  $paths
  * @return array<string, array{blob: string, size: int}>
  */
-function hive_workplan_ls_tree(string $root, string $ref, array $paths): array
+function hive_workplan_ls_tree(string $root, string $ref, array $paths, ?bool &$ok = null): array
 {
+    $ok = true;
     if ($paths === []) {
         return [];
     }
     $out = hive_git(array_merge(['ls-tree', '-r', '-l', '-z', $ref, '--'], $paths), $root, 3000);
+    $ok = $out !== null;
     $listed = [];
     foreach (array_slice(explode("\0", (string) $out), 0, 5000) as $record) {
         if (preg_match('/^100(?:644|755) blob ([0-9a-f]{40}) +(\d+)\t(.+)$/s', $record, $m) !== 1 || preg_match('//u', $m[3]) !== 1
@@ -44345,11 +44477,14 @@ function hive_plan_sync_file(): string
 /**
  * plan-sync.json as the client may use it: per workspace key
  * (hive_progress_ctx()'s), when it last synced, the remote commit, the
- * blob last sent or withheld per source, and the plans Hive asked for
- * (source => path), which each later sync follows too.
+ * blob last sent or withheld per source, the plans Hive asked for (source
+ * => path), which each later sync follows too, and the document limit the
+ * blobs were judged under (`max`, since the 2 MiB rollout; null in a file
+ * an older client wrote, which drops the key and still reads the rest: the
+ * file stays version 1).
  *
  * @param  array<string, mixed>|null  $raw
- * @return array{workspaces: array<string, array{synced_at: int, commit: string|null, blobs: array<string, string>, wanted: array<string, string>}>}
+ * @return array{workspaces: array<string, array{synced_at: int, commit: string|null, blobs: array<string, string>, wanted: array<string, string>, max: int|null}>}
  */
 function hive_plan_sync_shape(?array $raw): array
 {
@@ -44375,6 +44510,7 @@ function hive_plan_sync_shape(?array $raw): array
             'commit' => is_string($entry['commit'] ?? null) && hive_is_sha($entry['commit']) ? $entry['commit'] : null,
             'blobs' => $blobs,
             'wanted' => $wanted,
+            'max' => is_int($entry['max'] ?? null) && $entry['max'] >= 1024 && $entry['max'] <= HIVE_PLAN_DOC_MAX ? $entry['max'] : null,
         ];
     }
 
@@ -44625,8 +44761,10 @@ function hive_plan_verb_sync(array $args): int
         $lines[] = 'Every PROGRESS.md Hive has is up to date with '.$remote['ref'].'.';
     }
     if ($counts['withheld'] > 0) {
+        // The limit the sync held them to: the same cache's (hive_workplan_sync()).
         $lines[] = $counts['withheld'].' withheld: '.($counts['withheld'] === 1 ? 'it holds' : 'each holds')
-            .' something shaped like a credential or an invisible character, or is over 64 KB, so none of it was sent.';
+            .' something shaped like a credential or an invisible character, or is over '
+            .hive_plan_size_words(hive_plan_doc_max(hive_cache_load($slug) ?? hive_policy_cache_any())).', so none of it was sent.';
     }
     if ($counts['refused'] > 0) {
         $lines[] = $counts['refused'].' refused by Hive, as a document it cannot read as a plan.';
@@ -44708,7 +44846,9 @@ function hive_plan_verb_push(array $args): int
     [$source, $entry] = $found;
 
     $why = null;
-    $answer = hive_plan_file_capture($digest, hive_normalise_slashes($entry['root']), $entry['path'], $slug, $why);
+    // The agent waits: a large plan's upload window stays inside the verb's own budget.
+    $deadline = microtime(true) + HIVE_PROGRESS_SYNC_BUDGET;
+    $answer = hive_plan_file_capture($digest, hive_normalise_slashes($entry['root']), $entry['path'], $slug, $why, $deadline, $deadline);
     // Said here: the next tool call need not say it again.
     $line = null;
     hive_plan_files_mutate($digest, static function (array $files) use ($source, &$line): array {
@@ -44735,7 +44875,7 @@ function hive_plan_verb_push(array $args): int
             $why === 'unreached' ? 0 : 2);
     }
 
-    return hive_plan_push_said($answer, $entry['label'], $cmd);
+    return hive_plan_push_said($answer, $entry['label'], $cmd, hive_plan_doc_max(hive_cache_load($slug) ?? hive_policy_cache_any()));
 }
 
 /**
@@ -44780,7 +44920,14 @@ function hive_plan_push_stdin(array $opt, ?string $digest, string $cmd): int
     }
     $max = hive_plan_doc_max($cache);
     $raw = defined('STDIN') && ! (function_exists('stream_isatty') && @stream_isatty(STDIN)) ? @stream_get_contents(STDIN, $max + 1) : '';
-    $text = str_replace("\r\n", "\n", is_string($raw) ? $raw : '');
+    $raw = is_string($raw) ? $raw : '';
+    // The limit holds the bytes read, before CRLF becomes LF, as it holds a
+    // saved file's: read up to the limit and one byte, a longer CRLF plan
+    // came under it once converted and went cut off mid-line.
+    if (strlen($raw) > $max) {
+        return hive_progress_out([hive_plan_withheld_line('The plan on STDIN', 'too_large', $max)], HIVE_PROGRESS_NEXT_FIX, 2);
+    }
+    $text = str_replace("\r\n", "\n", $raw);
     unset($raw);
     if (trim($text) === '') {
         return hive_progress_out(['There was no plan on STDIN. Pipe the plan in: '.$cmd.' progress plan push --repo='.$repo.' - <<\'EOF\''], HIVE_PROGRESS_NEXT_FIX, 2);
@@ -44791,13 +44938,14 @@ function hive_plan_push_stdin(array $opt, ?string $digest, string $cmd): int
             HIVE_PROGRESS_NEXT_FIX, 2);
     }
     if ($problem !== null) {
-        return hive_progress_out([hive_plan_withheld_line('The plan on STDIN', $problem)], HIVE_PROGRESS_NEXT_FIX, 2);
+        return hive_progress_out([hive_plan_withheld_line('The plan on STDIN', $problem, $max)], HIVE_PROGRESS_NEXT_FIX, 2);
     }
 
     $source = $digest !== null ? (hive_plan_files_load($digest)['stdin'][$repo] ?? null) : null;
     $source = $source ?? bin2hex(random_bytes(16));
-    $answer = hive_plan_capture($source, ['kind' => 'stdin', 'repo' => $repo, 'text' => $text, 'client_session' => $digest],
-        microtime(true) + HIVE_PROGRESS_SYNC_BUDGET);
+    // The agent waits: a large plan's upload window stays inside the verb's own budget.
+    $deadline = microtime(true) + HIVE_PROGRESS_SYNC_BUDGET;
+    $answer = hive_plan_capture($source, ['kind' => 'stdin', 'repo' => $repo, 'text' => $text, 'client_session' => $digest], $deadline, $deadline);
     unset($text);
     if ($digest !== null) {
         hive_plan_files_mutate($digest, static function (array $files) use ($repo, $source): array {
@@ -44811,16 +44959,17 @@ function hive_plan_push_stdin(array $opt, ?string $digest, string $cmd): int
             HIVE_PROGRESS_NEXT_KEEP, 0);
     }
 
-    return hive_plan_push_said($answer, 'the plan on STDIN', $cmd);
+    return hive_plan_push_said($answer, 'the plan on STDIN', $cmd, $max);
 }
 
 /**
  * What `progress plan push` prints for Hive's answer: HIVE WORKPLAN with its
  * HIVE NEXT apart, the refusal's HIVE NOTE, or why Hive turned it down.
+ * $max is the limit the push was held to (hive_plan_doc_max()).
  *
  * @param  array<string, mixed>  $answer
  */
-function hive_plan_push_said(array $answer, string $label, string $cmd): int
+function hive_plan_push_said(array $answer, string $label, string $cmd, int $max): int
 {
     if (($answer['object'] ?? null) === 'workplan_capture') {
         $line = hive_plan_capture_line($answer, $cmd);
@@ -44834,7 +44983,7 @@ function hive_plan_push_said(array $answer, string $label, string $cmd): int
         return hive_progress_out([$at !== false ? substr($line, 0, $at) : $line, HIVE_PROGRESS_DATA_NOTE],
             $at !== false ? substr($line, $at + 1) : HIVE_PROGRESS_NEXT_KEEP, 0);
     }
-    $refusal = hive_plan_refusal_line($answer, hive_safe_text($label, HIVE_SAFE_PATH_MAX));
+    $refusal = hive_plan_refusal_line($answer, hive_safe_text($label, HIVE_SAFE_PATH_MAX), $max);
     if ($refusal !== null) {
         return hive_progress_out([$refusal], HIVE_PROGRESS_NEXT_FIX, 2);
     }
