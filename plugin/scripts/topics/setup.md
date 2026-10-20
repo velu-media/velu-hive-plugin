@@ -4,6 +4,9 @@
 - Day to day, `{{hive}}` writes only its own state under `{{hive_home}}/`, the progress report
   and the workplans mirror under `.hive/` in this workspace, and one `.hive-intent` line in each
   Velu repository's `.git/info/exclude`.
+- On a computer set up with the Velu Hive plugin, `{{hive}}` may also start Claude Code's own
+  `claude plugin marketplace update velu` and `claude plugin update velu-hive@velu` in the background,
+  for Hive's own plugin alone, when Hive names a newer client.
 - `hive.php setup` also writes Hive's hooks, status line, permission rules and the to-do tools
   setting (`CLAUDE_CODE_ENABLE_TODO_TOOLS`) into my user settings, `~/.claude/settings.json`
   (after a backup), and the Velu Hive section of CLAUDE.local.md.

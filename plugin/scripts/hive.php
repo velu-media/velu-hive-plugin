@@ -288,6 +288,14 @@ declare(strict_types=1);
 |   plan-file       Not a hook: the detached capture of a plan file the agent
 |                   wrote (rule 3a, SECTION 30), which mark-dirty starts once
 |                   the file has gone HIVE_PLAN_FILE_DEBOUNCE seconds unwritten.
+|   self-update     Not a hook: the detached run a plugin session start
+|                   starts when Hive's policy names a newer client: at the
+|                   first start after the news, then at most every six hours
+|                   per computer, every one to six while the plugin is not
+|                   published yet, once a day after two failures (SECTION
+|                   41). Runs Claude Code's own `claude plugin marketplace
+|                   update velu` and `claude plugin update velu-hive@velu`,
+|                   nothing else, and sends nothing to Hive.
 |   statusline      statusLine command. ZERO network. Ambient state, 0 tokens.
 |   check           Not a hook: the agent runs it before a task's first
 |                   edit with the files and folders it plans to change.
@@ -388,7 +396,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.21.4';
+const HIVE_VERSION = '1.22.0';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1187,14 +1195,15 @@ const HIVE_SETUP_CODE_REJECTED = 'This setup code is invalid, expired or already
 const HIVE_SETUP_HOOK_VERBS = ['session-start', 'pre-edit', 'mark-dirty', 'flush', 'session-end', 'statusline', 'capture-plan', 'capture-steps', 'resume-watch', 'subagent'];
 /*
 | Every hook verb: the ones hooks run, and the ones they start detached
-| (publish, plan-sync, plan-file). Their stdout is a protocol, never a
-| report. A hook verb is never removed or renamed, only turned into a
-| silent no-op: an older plugin's hooks.json still sends it, and an older
-| copy hands it to the newest installed one (hive_plugin_forward()).
+| (publish, plan-sync, plan-file, and self-update, SECTION 41). Their stdout
+| is a protocol, never a report. A hook verb is never removed or renamed,
+| only turned into a silent no-op: an older plugin's hooks.json still sends
+| it, and an older copy hands it to the newest installed one
+| (hive_plugin_forward()).
 */
 const HIVE_HOOK_VERBS = [
     'session-start', 'pre-edit', 'mark-dirty', 'flush', 'session-end', 'statusline', 'publish',
-    'capture-plan', 'capture-steps', 'resume-watch', 'plan-sync', 'subagent', 'plan-file',
+    'capture-plan', 'capture-steps', 'resume-watch', 'plan-sync', 'subagent', 'plan-file', 'self-update',
 ];
 /*
 | The Velu Hive plugin for Claude Code (client 1.14.0, SECTION 35): the
@@ -2219,6 +2228,9 @@ function hive_main(array $argv): int
             case 'publish':       return hive_verb_publish($args);
             case 'plan-sync':     return hive_verb_plan_sync($args);
             case 'plan-file':     return hive_verb_plan_file($args);
+            // Not a hook, never in help: the detached update a plugin
+            // session start starts when it is due (SECTION 41).
+            case 'self-update':   return hive_verb_self_update();
             case 'statusline':    return hive_verb_statusline();
             case 'check':         return hive_verb_check($args);
             case 'free':          return hive_verb_free($args);
@@ -11439,10 +11451,14 @@ function hive_verb_session_start(): int
     }
 
     // Board approvals' launcher (C2, SECTION 34c): installed, rewritten or
-    // removed as the policy this start fetched says, detached. Last: it
-    // closes this process's stdio.
+    // removed as the policy this start fetched says, detached. Then the
+    // self-update (SECTION 41), started detached when the same policy names
+    // a newer client and one is due on this computer. Last: each closes
+    // this process's stdio.
     if ($roots !== []) {
-        hive_launcher_upkeep(hive_session_load($input['session_id'] ?? 'default'));
+        $started = hive_session_load($input['session_id'] ?? 'default');
+        hive_launcher_upkeep($started);
+        hive_self_update_upkeep($started);
     }
 
     return 0;
@@ -20934,6 +20950,11 @@ function hive_verb_doctor(): int
     foreach (hive_doctor_plugin() as $row) {
         $add($row[0], $row[1], $row[2]);
     }
+    // The self-update on a plugin machine (SECTION 41): on or off and why,
+    // and how its last run went.
+    foreach (hive_doctor_self_update() as $row) {
+        $add($row[0], $row[1], $row[2]);
+    }
 
     // ---- and whether they run, in the workspace found from here --------------
     $registered = $pluginMachine ? hive_plugin_installed_root() !== null : ($hookRows[0][1] ?? 'FAIL') !== 'FAIL';
@@ -21402,10 +21423,11 @@ function hive_doctor_work_plans(): array
 
 /**
  * The version `claude --version` prints (HIVE_CLAUDE_BIN names another
- * program), or null: not on this shell's PATH, too slow (3 s), or no
- * version in what it said.
+ * program, and $claude, when given, the one the self-update found: SECTION
+ * 41), or null: not on this shell's PATH, too slow (3 s), or no version in
+ * what it said.
  */
-function hive_claude_code_version(): ?string
+function hive_claude_code_version(?string $claude = null): ?string
 {
     if (! function_exists('proc_open')) {
         return null;
@@ -21417,7 +21439,7 @@ function hive_claude_code_version(): ?string
         return null;
     }
     $options = PHP_OS_FAMILY === 'Windows' ? ['bypass_shell' => true] : [];
-    $process = @proc_open([hive_env('HIVE_CLAUDE_BIN') ?? 'claude', '--version'], [0 => ['file', $null, 'r'], 1 => $out, 2 => ['file', $null, 'w']],
+    $process = @proc_open([$claude ?? hive_env('HIVE_CLAUDE_BIN') ?? 'claude', '--version'], [0 => ['file', $null, 'r'], 1 => $out, 2 => ['file', $null, 'w']],
         $pipes, null, null, $options);
     if (! is_resource($process)) {
         @fclose($out);
@@ -21718,6 +21740,14 @@ function hive_verb_purge(array $args): int
             return hive_setup_fail('A Hive setup started on this computer '.$running.' seconds ago and may still be running. '
                 .'Purge removes Hive once it has ended.', 'Nothing was removed.');
         }
+    }
+    // Nor while the self-update (SECTION 41) runs Claude Code's update of the
+    // plugin this purge uninstalls: it would install it again under the
+    // purge's feet. A run ends within minutes, each command bounded; the
+    // words say how old its claim is, and when a process holds the lock
+    // past any run.
+    if (hive_self_update_running($home)) {
+        return hive_setup_fail(hive_self_update_purge_words($home, time()), 'Nothing was removed.');
     }
 
     // ---- 1. the user settings: all of Hive's, or nothing at all -----------------
@@ -22627,7 +22657,8 @@ function hive_purge_home(string $home, bool $whole): array
  * state and logs, the plan files, the two flags, the lanes each session
  * holds, what each session was told and the plan sync (client 1.11.0), the
  * collision prompts remembered (SECTION 12b), the launcher's launcher.json,
- * tick lock and Windows task XML (SECTION 34c), and each one's lock, rotation (.1) and the
+ * tick lock and Windows task XML (SECTION 34c), the self-update's record,
+ * its lock and its run lock (SECTION 41), and each one's lock, rotation (.1) and the
  * temp file a write goes through.
  */
 function hive_purge_is_home_file(string $name): bool
@@ -22635,7 +22666,8 @@ function hive_purge_is_home_file(string $name): bool
     return preg_match('/^(?:hive\.php|\.env\.hive|state\.json|outbox\.ndjson|audit\.ndjson|plan-asked\.json|proceed\.json|progress\.log|plan\.log|notices|off'
         // The install id and its host's hash (hunt 7, Task 38).
         .'|install\.id|install\.host'
-        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|prompts\.(?:json|lock)|plugin-root|launcher\.(?:json|lock)|launcher-task\.xml)'
+        .'|lanes\.(?:json|lock)|broker-said\.(?:json|lock)|plan-sync\.(?:json|lock)|prompts\.(?:json|lock)|plugin-root|launcher\.(?:json|lock)|launcher-task\.xml'
+        .'|self-update\.(?:json|lock|run|config\.json))'
         .'(?:\.lock|\.1|\.\d+(?:\.hive)?\.tmp)?$/', $name) === 1;
 }
 
@@ -41302,12 +41334,14 @@ function hive_claude_timeout_ms(): int
  * environment passed through as it is (CLAUDE_CONFIG_DIR and
  * CLAUDE_CODE_PLUGIN_CACHE_DIR included, so the CLI writes where Claude Code
  * reads). Every argument is a constant of this file, or a path setup made.
- * $cwd is the folder it runs in, this process's when null.
+ * $cwd is the folder it runs in, this process's when null. $maxBytes, when
+ * given, is the most read back of each of its two outputs (the self-update,
+ * SECTION 41, which keeps one line of them).
  *
  * @param  list<string>  $args
  * @return array{code: ?int, out: string, err: string, timed_out: bool}
  */
-function hive_claude_run(string $claude, array $args, int $timeoutMs, ?string $cwd = null): array
+function hive_claude_run(string $claude, array $args, int $timeoutMs, ?string $cwd = null, ?int $maxBytes = null): array
 {
     $result = ['code' => null, 'out' => '', 'err' => '', 'timed_out' => false];
     if (! function_exists('proc_open')) {
@@ -41356,7 +41390,7 @@ function hive_claude_run(string $claude, array $args, int $timeoutMs, ?string $c
 
     foreach (['out' => $out, 'err' => $err] as $key => $file) {
         @rewind($file);
-        $result[$key] = (string) @stream_get_contents($file);
+        $result[$key] = (string) @stream_get_contents($file, $maxBytes);
         @fclose($file);
     }
 
@@ -63193,19 +63227,24 @@ function hive_doctor_plugin(): array
 
         $rows[] = hive_doctor_managed_policy();
 
-        $settings = hive_read_json(hive_claude_config_dir().'/settings.json');
-        $entry = is_array($settings) && is_array($settings['extraKnownMarketplaces'][HIVE_PLUGIN_MARKETPLACE] ?? null)
-            ? $settings['extraKnownMarketplaces'][HIVE_PLUGIN_MARKETPLACE] : [];
-        $rows[] = ['auto-update', 'ok', ($entry['autoUpdate'] ?? null) === true ? 'on'
-            : 'off -- Hive updates only when claude plugin update '.HIVE_PLUGIN_ID.' runs (the switch is in /plugin -> Marketplaces -> '.HIVE_PLUGIN_MARKETPLACE.')'];
+        // Read as the self-update reads it: the settings entry, else
+        // known_marketplaces.json (hive_self_update_marketplace(), SECTION 41).
+        $auto = hive_self_update_marketplace()['auto'];
+        $rows[] = ['auto-update', 'ok', $auto === true ? 'on' : ($auto === false
+            ? 'off -- Hive updates only when claude plugin update '.HIVE_PLUGIN_ID.' runs (the switch is in /plugin -> Marketplaces -> '.HIVE_PLUGIN_MARKETPLACE.')'
+            : 'not set (updates not pinned) -- the switch is in /plugin -> Marketplaces -> '.HIVE_PLUGIN_MARKETPLACE)];
 
-        if (getenv('FORCE_AUTOUPDATE_PLUGINS') !== '1') {
-            foreach (['DISABLE_AUTOUPDATER', 'DISABLE_UPDATES', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'] as $variable) {
-                $value = getenv($variable);
-                if (is_string($value) && $value !== '' && $value !== '0') {
+        // Read as Claude Code reads them, each by its own reader
+        // (hive_claude_switch_on(), hive_self_update_config_off(), SECTION 41).
+        if (! hive_claude_env_on(getenv('FORCE_AUTOUPDATE_PLUGINS'))) {
+            foreach (HIVE_SELF_UPDATE_BLOCKERS as $variable => $reader) {
+                if (hive_claude_switch_on($reader, getenv($variable))) {
                     $rows[] = ['updates', 'WARN', 'updates blocked by '.$variable.' -- Hive updates only when claude plugin update '.HIVE_PLUGIN_ID.' runs, or with FORCE_AUTOUPDATE_PLUGINS=1 beside it'];
                 }
             }
+        }
+        if (hive_self_update_config_off()) {
+            $rows[] = ['updates', 'WARN', 'updates blocked by autoUpdates false in Claude Code\'s global config ('.basename(hive_claude_global_config()).') -- Hive updates only when claude plugin update '.HIVE_PLUGIN_ID.' runs, or with FORCE_AUTOUPDATE_PLUGINS=1'];
         }
 
         $version = hive_claude_code_version();
@@ -63357,6 +63396,13 @@ function hive_plugin_session_upkeep(): void
 
             return $global;
         });
+    }
+
+    // The self-update (SECTION 41): once, at the first session start that
+    // runs the client it brought.
+    $updated = hive_self_update_note();
+    if ($updated !== null) {
+        $lines[] = $updated;
     }
 
     if (($setup['settings_version'] ?? null) !== HIVE_VERSION) {
@@ -63886,6 +63932,1494 @@ function hive_loader_source(): string
         LOADER;
 
     return strtr($source, ['__MARK__' => HIVE_LOADER_MARK, '__VERBS__' => $verbs, '__REPOSITORY__' => var_export(hive_plugin_repository(), true)]);
+}
+
+// =============================================================================
+// SECTION 41 -- self-update: a plugin machine keeps its client current
+// =============================================================================
+
+/*
+| docs/client/plugin.md, "Self-update"; the plan and its Rulings are
+| docs/superpowers/plans/2026-10-20-selfupdate.md.
+|
+| Claude Code's own background refresh of the velu marketplace runs only in
+| an interactive session, after its first message and a random delay, fails
+| quietly when git would prompt, and may not run in an editor extension at
+| all: on 19 Oct 2026 33 of 46 machines ran an older client. What always
+| brought the newest, within seconds, was Claude Code's own two commands.
+| So on a plugin machine:
+|
+|   1. Hive's policy says which client is newest (`client.latest`, beside the
+|      owners' switch `client.self_update`), to an older plugin client only.
+|   2. A plugin session start, last and after its answer, claims one attempt
+|      for the whole computer in <home>/self-update.json, under
+|      self-update.lock, when one is due (hive_self_update_due()), and starts
+|      `self-update` detached (hive_self_update_upkeep()).
+|   3. `self-update` takes self-update.run.lock, waiting a quarter of a
+|      second at most (HIVE_SELF_UPDATE_RUN_WAIT), takes its claim
+|      (hive_self_update_take(): run_at, by its id, never twice), finds
+|      `claude` (hive_self_update_find_claude()), and runs
+|      `claude plugin marketplace update velu`, then, only if that worked and
+|      the marketplace holds something newer than the installed copy,
+|      `claude plugin update velu-hive@velu`, each in Claude Code's home
+|      folder with a hard timeout, never with -y, and stands down between
+|      them once the computer stops updating itself (a purge, a switch). It
+|      records what came of it and exits 0, whatever happens.
+|   4. The next plugin session start says once that Hive updated itself;
+|      doctor says whether it is on and how the last run went.
+|
+| When the next attempt may start (hive_self_update_next_at()): at the first
+| session start after Hive names a newer client; six hours after an attempt,
+| and after one failure; a day after two failures in a row; and while the
+| marketplace holds no newer release yet (the deploy publishes the plugin
+| last), an hour, then two, four, and six at most.
+|
+| It runs only where Claude Code itself would update the plugin: the velu
+| marketplace Hive's own, its autoUpdate not set false, none of
+| DISABLE_UPDATES, DISABLE_AUTOUPDATER or
+| CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC on, and autoUpdates not false in
+| Claude Code's global config, unless FORCE_AUTOUPDATE_PLUGINS is on: each
+| read as Claude Code 2.1.301 reads it (HIVE_SELF_UPDATE_BLOCKERS).
+| HIVE_SELF_UPDATE=0 turns it off on one computer. Nothing new is sent to
+| Hive: the one new traffic is Claude Code's own fetch of the velu
+| marketplace.
+*/
+
+// How long after an attempt the next may start: six hours, and after one
+// failure; a day after HIVE_SELF_UPDATE_FAILURES failures in a row.
+const HIVE_SELF_UPDATE_EVERY = 21_600;
+const HIVE_SELF_UPDATE_BACKOFF = 86_400;
+const HIVE_SELF_UPDATE_FAILURES = 2;
+// While the marketplace holds no newer release yet: an hour after the first
+// such run, doubling each time to six hours at most; doctor says so once
+// that has gone on for a day.
+const HIVE_SELF_UPDATE_BEHIND = 3_600;
+const HIVE_SELF_UPDATE_BEHIND_MAX = 21_600;
+const HIVE_SELF_UPDATE_BEHIND_WARN = 86_400;
+// Seconds each command may take (HIVE_SELF_UPDATE_TIMEOUT, 1 to 300): Claude
+// Code's own git clone gives up at 120.
+const HIVE_SELF_UPDATE_TIMEOUT_DEFAULT = 150;
+// A claim the updater runs on is at most this old: longer than the longest
+// run there can be (`claude --version`'s 3 s, then two commands of 300 s at
+// most, each ended with HIVE_PROCESS_KILL_GRACE), so doctor's "never
+// finished" is never said of a run still going. One this far ahead of the
+// clock is a clock moved back, and a time past HIVE_SELF_UPDATE_LAST_TIME
+// (2100) is none this client wrote.
+const HIVE_SELF_UPDATE_CLAIM_TTL = 900;
+const HIVE_SELF_UPDATE_SKEW = 300;
+// How long a fresh updater waits for its run lock, asked again every few
+// milliseconds: past the instant another process's probe
+// (hive_self_update_running(), a session start's claim, doctor, purge) holds
+// it, never as long as a run that is going on.
+const HIVE_SELF_UPDATE_RUN_WAIT = 0.25;
+const HIVE_SELF_UPDATE_LAST_TIME = 4_102_444_800;
+// What is read of each output a command wrote, and kept of its first line.
+const HIVE_SELF_UPDATE_READ_MAX = 65_536;
+const HIVE_SELF_UPDATE_SAID_MAX = 200;
+// The two commands, in order, by the step each is recorded as. Constants of
+// this file only: never -y, never a word from the server.
+const HIVE_SELF_UPDATE_STEPS = [
+    'marketplace' => ['plugin', 'marketplace', 'update', HIVE_PLUGIN_MARKETPLACE],
+    'plugin' => ['plugin', 'update', HIVE_PLUGIN_ID],
+];
+// Claude Code's own switches that stop its plugin updates, in the order it
+// asks them (2.1.301), each by its own reader (hive_claude_switch_on()):
+// 'word' is on for 1, true, yes or on in any case, blanks around them
+// ignored (HIVE_CLAUDE_ENV_ON); 'any' is on for any value at all, 0 and
+// false too, and off only when empty or not set. FORCE_AUTOUPDATE_PLUGINS,
+// a 'word', lets plugin updates through every one of them and through the
+// global config's autoUpdates false (hive_self_update_config_off()).
+const HIVE_SELF_UPDATE_BLOCKERS = [
+    'DISABLE_UPDATES' => 'word',
+    'DISABLE_AUTOUPDATER' => 'word',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' => 'any',
+];
+const HIVE_CLAUDE_ENV_ON = ['1', 'true', 'yes', 'on'];
+// The most of Claude Code's global config (~/.claude.json) read for its
+// three update keys: a larger file switches nothing off here.
+const HIVE_SELF_UPDATE_CONFIG_MAX = 16_777_216;
+const HIVE_SELF_UPDATE_CONFIG_KEYS = ['autoUpdates', 'installMethod', 'autoUpdatesProtectedForNative'];
+// How long the answer read from that config is kept, its file unchanged
+// (hive_self_update_config_off()).
+const HIVE_SELF_UPDATE_CONFIG_RECHECK = 21_600;
+// The deepest a JSON value is walked (hive_json_value_end()): deeper reads
+// as no file. Claude Code's own config nests a handful of levels.
+const HIVE_JSON_DEPTH_MAX = 512;
+// What a run needs to start a program, watch it and end it.
+const HIVE_SELF_UPDATE_PROC = ['proc_open', 'proc_get_status', 'proc_terminate', 'proc_close'];
+
+/** <home>/self-update.json: this computer's one record of its last attempt. */
+function hive_self_update_file(): string
+{
+    return hive_home().'/self-update.json';
+}
+
+/**
+ * How this section opens its lock files: close-on-exec off Windows, so no
+ * `claude` or `git` it starts holds them, and a run killed outright frees
+ * its lock with it.
+ */
+function hive_self_update_lock_mode(): string
+{
+    return PHP_OS_FAMILY === 'Windows' ? 'c' : 'ce';
+}
+
+/** A version as this section reads one: x.y.z, each part 1 to 4 digits, as the plugin tree reads HIVE_VERSION. Pure. */
+function hive_self_update_version($value): ?string
+{
+    return is_string($value) && preg_match('/^\d{1,4}\.\d{1,4}\.\d{1,4}\z/', $value) === 1 ? $value : null;
+}
+
+/** A plugin version as Claude Code records one (installed_plugins.json, plugin.json), suffix and all, or null. Pure. */
+function hive_self_update_plugin_version($value): ?string
+{
+    return is_string($value) && preg_match('/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]{1,40})?\z/', $value) === 1 ? $value : null;
+}
+
+/**
+ * The newer client Hive's policy names for this one, or null: the policy's
+ * `client` block says `self_update: true` and its `latest` is a version
+ * newer than $running. Anything else the server sent -- no block, a
+ * number, a list, `1.x`, a thousand digits -- is no word at all. Pure.
+ *
+ * @param  array<string, mixed>|null  $cache
+ */
+function hive_self_update_latest(?array $cache, string $running): ?string
+{
+    $block = hive_policy_value($cache, 'client', null);
+    if (! is_array($block) || ($block['self_update'] ?? null) !== true) {
+        return null;
+    }
+
+    $latest = hive_self_update_version($block['latest'] ?? null);
+
+    return $latest !== null && version_compare($latest, $running, '>') ? $latest : null;
+}
+
+/**
+ * self-update.json as this client may use it, or null for none, or for one
+ * it cannot read: every field held to its shape, an unknown one dropped. A
+ * started_at that is no time this client wrote (0 or less, past 2100) is
+ * one it cannot read. run_at is when a run took the claim (hive_self_update_run()),
+ * null until one does. Pure.
+ *
+ * @return array{v: int, id: ?string, client: ?string, latest: ?string, started_at: int, finished_at: ?int, run_at: ?int, result: ?string,
+ *     step: ?string, exit: ?int, timed_out: bool, seconds: ?int, claude: ?string, said: ?string, to: ?string,
+ *     published: ?string, failures: int, behinds: int, behind_since: ?int, note: ?array{to: string, at: int}}|null
+ */
+function hive_self_update_shape($raw): ?array
+{
+    $at = is_array($raw) ? ($raw['started_at'] ?? null) : null;
+    if (! is_int($at) || $at <= 0 || $at > HIVE_SELF_UPDATE_LAST_TIME) {
+        return null;
+    }
+
+    $word = static fn ($value, array $known): ?string => is_string($value) && in_array($value, $known, true) ? $value : null;
+    $time = static fn ($value): ?int => is_int($value) && $value > 0 && $value <= HIVE_SELF_UPDATE_LAST_TIME ? $value : null;
+    $count = static fn ($value): int => is_int($value) ? max(0, min(1000, $value)) : 0;
+    $note = is_array($raw['note'] ?? null) ? $raw['note'] : null;
+    $noteTo = $note !== null ? hive_self_update_version($note['to'] ?? null) : null;
+
+    return [
+        'v' => 1,
+        'id' => is_string($raw['id'] ?? null) && preg_match('/^[0-9a-f]{16}\z/', $raw['id']) === 1 ? $raw['id'] : null,
+        'client' => hive_self_update_version($raw['client'] ?? null),
+        'latest' => hive_self_update_version($raw['latest'] ?? null),
+        'started_at' => $at,
+        'finished_at' => $time($raw['finished_at'] ?? null),
+        'run_at' => $time($raw['run_at'] ?? null),
+        'result' => $word($raw['result'] ?? null, ['updated', 'current', 'behind', 'failed', 'stopped']),
+        'step' => $word($raw['step'] ?? null, ['find', 'marketplace', 'plugin']),
+        'exit' => is_int($raw['exit'] ?? null) ? $raw['exit'] : null,
+        'timed_out' => ($raw['timed_out'] ?? false) === true,
+        'seconds' => is_int($raw['seconds'] ?? null) ? max(0, min(100_000, $raw['seconds'])) : null,
+        'claude' => is_string($raw['claude'] ?? null) && preg_match('/^\d{1,3}\.\d{1,3}\.\d{1,4}\z/', $raw['claude']) === 1 ? $raw['claude'] : null,
+        'said' => is_string($raw['said'] ?? null) ? hive_self_update_clean($raw['said']) : null,
+        'to' => hive_self_update_plugin_version($raw['to'] ?? null),
+        'published' => hive_self_update_plugin_version($raw['published'] ?? null),
+        'failures' => $count($raw['failures'] ?? null),
+        'behinds' => $count($raw['behinds'] ?? null),
+        'behind_since' => $time($raw['behind_since'] ?? null),
+        'note' => $noteTo !== null && is_int($note['at'] ?? null) ? ['to' => $noteTo, 'at' => $note['at']] : null,
+    ];
+}
+
+/** self-update.json, shaped; null for none or one that does not read. */
+function hive_self_update_load(): ?array
+{
+    return hive_self_update_shape(hive_read_json(hive_self_update_file()));
+}
+
+/**
+ * Did a run take $record (run_at) without finishing it lately enough that
+ * its `claude` may still be going: run_at less than
+ * HIVE_SELF_UPDATE_CLAIM_TTL ago, and not further ahead of the clock than
+ * HIVE_SELF_UPDATE_SKEW, read as hive_self_update_runnable() reads a
+ * claim's started_at, so a clock moved back frees it at once and nothing
+ * holds a claim past its own time. Pure.
+ *
+ * @param  array<string, mixed>|null  $record  hive_self_update_shape()'s
+ */
+function hive_self_update_taken_lately(?array $record, int $now): bool
+{
+    $at = $record['run_at'] ?? null;
+
+    return $record !== null && $record['result'] === null && is_int($at)
+        && $now - $at < HIVE_SELF_UPDATE_CLAIM_TTL && $at <= $now + HIVE_SELF_UPDATE_SKEW;
+}
+
+/**
+ * Is $record a claim a run took (run_at) and never finished: ended
+ * mid-run, by a kill, a crash or the computer going down, or still going?
+ * Read as one more failure in a row (hive_self_update_failures()). Pure.
+ *
+ * @param  array<string, mixed>|null  $record  hive_self_update_shape()'s
+ */
+function hive_self_update_unfinished(?array $record): bool
+{
+    return $record !== null && $record['result'] === null && is_int($record['run_at'] ?? null);
+}
+
+/**
+ * The failures in a row $record stands for: those it counts, and one more
+ * for a run that took it and never finished (hive_self_update_unfinished()).
+ * Pure.
+ *
+ * @param  array<string, mixed>  $record  hive_self_update_shape()'s
+ */
+function hive_self_update_failures(array $record): int
+{
+    return (int) ($record['failures'] ?? 0) + (hive_self_update_unfinished($record) ? 1 : 0);
+}
+
+/**
+ * When the next attempt may start, after $record's: six hours after it, and
+ * after one failure; a day after it once HIVE_SELF_UPDATE_FAILURES runs in
+ * a row failed, a run that never finished counted as one
+ * (hive_self_update_failures()); after a run that found the marketplace
+ * holding no newer release, an hour, two, four, then six at most for each
+ * such run in a row. Pure.
+ *
+ * @param  array{started_at: int, result: ?string, failures: int, behinds?: int, run_at?: ?int}  $record
+ */
+function hive_self_update_next_at(array $record): int
+{
+    if ($record['result'] === 'behind') {
+        $runs = max(1, min(10, (int) ($record['behinds'] ?? 1)));
+
+        return $record['started_at'] + min(HIVE_SELF_UPDATE_BEHIND_MAX, HIVE_SELF_UPDATE_BEHIND * 2 ** ($runs - 1));
+    }
+    if (($record['result'] === 'failed' || hive_self_update_unfinished($record)) && hive_self_update_failures($record) >= HIVE_SELF_UPDATE_FAILURES) {
+        return $record['started_at'] + HIVE_SELF_UPDATE_BACKOFF;
+    }
+
+    return $record['started_at'] + HIVE_SELF_UPDATE_EVERY;
+}
+
+/**
+ * May an attempt start now? Yes with no record (or one that does not
+ * read), when a client newer than the one that claimed the last attempt
+ * runs here (a fresh start; an older one, two copies taking turns, keeps
+ * the clock), when the last claim is further ahead of the clock than
+ * HIVE_SELF_UPDATE_SKEW (a clock moved back), and once
+ * hive_self_update_next_at() has passed. Pure.
+ *
+ * @param  array<string, mixed>|null  $record  hive_self_update_shape()'s
+ */
+function hive_self_update_due(?array $record, string $running, int $now): bool
+{
+    if ($record === null) {
+        return true;
+    }
+    if (is_string($record['client']) && version_compare($running, $record['client'], '>')) {
+        return true;
+    }
+    if ($record['started_at'] > $now + HIVE_SELF_UPDATE_SKEW) {
+        return true;
+    }
+
+    return $now >= hive_self_update_next_at($record);
+}
+
+/**
+ * The record of a new attempt $id, claimed at $now by client $running for
+ * $latest: the outcome fields empty; the failures and the marketplace's
+ * behind runs in a row kept, unless a newer client than the last claimant
+ * runs (a fresh start), a last claim whose run never finished counted as
+ * one more failure, which forgets the behind runs as a failed run does; and
+ * a note not said yet kept. Its client is the
+ * newer of $running and the last claimant's: an older copy taking its turn
+ * (a window still open on it) keeps the clock and the streaks, so the newer
+ * copy's next start is not a fresh start again. Pure.
+ *
+ * @param  array<string, mixed>|null  $record  hive_self_update_shape()'s
+ * @return array<string, mixed>
+ */
+function hive_self_update_claimed(?array $record, string $latest, string $running, int $now, string $id): array
+{
+    $fresh = $record === null || ! is_string($record['client']) || version_compare($running, $record['client'], '>');
+    $ended = ! $fresh && hive_self_update_unfinished($record);
+
+    return [
+        'v' => 1, 'id' => $id, 'client' => $fresh ? $running : $record['client'], 'latest' => $latest, 'started_at' => $now, 'finished_at' => null, 'run_at' => null,
+        'result' => null, 'step' => null, 'exit' => null, 'timed_out' => false, 'seconds' => null,
+        'claude' => null, 'said' => null, 'to' => null, 'published' => null,
+        'failures' => $fresh ? 0 : hive_self_update_failures($record),
+        'behinds' => $fresh || $ended ? 0 : (int) ($record['behinds'] ?? 0),
+        'behind_since' => $fresh || $ended ? null : ($record['behind_since'] ?? null),
+        'note' => $record['note'] ?? null,
+    ];
+}
+
+/**
+ * $record with $outcome written in at $now. A failed run: one more failure
+ * in a row, and the behind runs forgotten. A behind run: one more of those
+ * in a row, since the first of them, and the failures forgotten. Updated or
+ * current: both forgotten, and an update leaves the note to say. Stopped
+ * (the computer stopped updating itself mid-run): both kept as they were.
+ * Pure.
+ *
+ * @param  array<string, mixed>  $record  hive_self_update_shape()'s
+ * @param  array{result: string, step: ?string, exit: ?int, timed_out: bool, seconds: int, claude: ?string, said: ?string, to: ?string, published: ?string}  $outcome
+ * @return array<string, mixed>
+ */
+function hive_self_update_finished(array $record, array $outcome, int $now): array
+{
+    $failures = (int) ($record['failures'] ?? 0);
+    $behinds = (int) ($record['behinds'] ?? 0);
+    $since = $record['behind_since'] ?? null;
+    $record = array_merge($record, $outcome, ['finished_at' => $now]);
+
+    [$record['failures'], $record['behinds'], $record['behind_since']] = match ($outcome['result']) {
+        'failed' => [$failures + 1, 0, null],
+        'behind' => [0, $behinds + 1, $since ?? $record['started_at']],
+        'stopped' => [$failures, $behinds, $since],
+        default => [0, 0, null],
+    };
+    if ($outcome['result'] === 'updated' && hive_self_update_version($outcome['to']) !== null) {
+        $record['note'] = ['to' => $outcome['to'], 'at' => $now];
+    }
+
+    return $record;
+}
+
+/**
+ * self-update.json read, changed and written back under self-update.lock,
+ * waited for $wait seconds at most (hive_flock_within()). $change gets the
+ * record (null for none, or one that does not read) and returns the new
+ * one, or null to write nothing. True when it wrote; false when $change
+ * asked for nothing, the lock stayed held all that time, no lock file can be
+ * made (a home that cannot be written), the write failed, or the home is
+ * gone: it never makes the home again (a purge took it). A file system that
+ * locks nothing is written unlocked, as state.json is.
+ *
+ * @param  callable(?array<string, mixed>): ?array<string, mixed>  $change
+ */
+function hive_self_update_mutate(callable $change, float $wait): bool
+{
+    clearstatcache();
+    if (! is_dir(hive_home())) {
+        return false;
+    }
+    $lock = @fopen(hive_home().'/self-update.lock', hive_self_update_lock_mode());
+    if (! is_resource($lock)) {
+        return false;
+    }
+    $hold = hive_flock_within($lock, $wait, 'self-update');
+    if ($hold === 'busy') {
+        @fclose($lock);
+
+        return false;
+    }
+
+    try {
+        $next = $change(hive_self_update_load());
+
+        return $next !== null && is_dir(hive_home()) && hive_write_json(hive_self_update_file(), $next);
+    } finally {
+        if ($hold === 'held') {
+            @flock($lock, LOCK_UN);
+        }
+        @fclose($lock);
+    }
+}
+
+/**
+ * Claim one attempt for this computer at $now, for $latest, when one is due
+ * as the record stands under the lock, no run of the claim it holds is
+ * going, and no run took it lately without finishing it
+ * (hive_self_update_taken_lately()): true only when this process wrote the claim and reads it back as
+ * its own, by its id, so of five sessions starting at once one starts the
+ * updater, and a home that keeps no write starts none.
+ */
+function hive_self_update_claim(string $latest, int $now): bool
+{
+    try {
+        $id = bin2hex(random_bytes(8));
+    } catch (Throwable $e) {
+        return false;
+    }
+
+    $wrote = hive_self_update_mutate(static function (?array $record) use ($latest, $now, $id): ?array {
+        // A claim whose run is still going is never replaced, even one that
+        // reads as due because the clock moved back meanwhile: its outcome
+        // is written onto it by its id. Nor one a run took a moment ago and
+        // never finished: its `claude` may outlive a killed run, and holds
+        // no lock (they are close-on-exec), so no second update starts
+        // beside it until the claim's own time is up.
+        if ($record !== null && $record['result'] === null
+            && (hive_self_update_taken_lately($record, $now) || hive_self_update_running(hive_home()))) {
+            return null;
+        }
+
+        return hive_self_update_due($record, HIVE_VERSION, $now) ? hive_self_update_claimed($record, $latest, HIVE_VERSION, $now, $id) : null;
+    }, HIVE_LOCK_STUCK_WAIT);
+    $record = $wrote ? hive_self_update_load() : null;
+
+    return $record !== null && $record['id'] === $id && $record['result'] === null;
+}
+
+/**
+ * Is $record an attempt a run may still take: claimed (an id), naming a
+ * version, unfinished, never taken by a run (run_at), at most
+ * HIVE_SELF_UPDATE_CLAIM_TTL old, not ahead of the clock, and, given $id,
+ * that very claim? Pure.
+ *
+ * @param  array<string, mixed>|null  $record  hive_self_update_shape()'s
+ */
+function hive_self_update_runnable(?array $record, ?string $id, int $now): bool
+{
+    return $record !== null && is_string($record['id']) && ($id === null || $record['id'] === $id)
+        && $record['latest'] !== null && $record['result'] === null && ($record['run_at'] ?? null) === null
+        && $now - $record['started_at'] <= HIVE_SELF_UPDATE_CLAIM_TTL && $record['started_at'] <= $now + HIVE_SELF_UPDATE_SKEW;
+}
+
+/** Is $value a switch Claude Code reads as on, by its words: 1, true, yes or on, in any case, blanks around them ignored? Pure. */
+function hive_claude_env_on($value): bool
+{
+    return is_string($value) && in_array(strtolower(trim($value)), HIVE_CLAUDE_ENV_ON, true);
+}
+
+/** Is $value on by $reader, one of HIVE_SELF_UPDATE_BLOCKERS' readers: 'word' (hive_claude_env_on()), 'any' (any value but an empty one)? Pure. */
+function hive_claude_switch_on(string $reader, $value): bool
+{
+    return $reader === 'any' ? is_string($value) && $value !== '' : hive_claude_env_on($value);
+}
+
+/**
+ * Which of Claude Code's own update switches in $env stops its plugin
+ * updates, or null: the first of HIVE_SELF_UPDATE_BLOCKERS that is on by its
+ * own reader, unless FORCE_AUTOUPDATE_PLUGINS is on beside it. Pure.
+ *
+ * @param  array<string, string>  $env
+ */
+function hive_self_update_blocker(array $env): ?string
+{
+    if (hive_claude_env_on($env['FORCE_AUTOUPDATE_PLUGINS'] ?? null)) {
+        return null;
+    }
+
+    foreach (HIVE_SELF_UPDATE_BLOCKERS as $name => $reader) {
+        if (hive_claude_switch_on($reader, $env[$name] ?? null)) {
+            return $name;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Claude Code's global config file, found as it finds it: the old
+ * .config.json in its config folder when that holds anything, else
+ * .claude.json in CLAUDE_CONFIG_DIR, or in its home folder when that is not
+ * set; .claude-custom-oauth.json there instead while
+ * CLAUDE_CODE_CUSTOM_OAUTH_URL is set (Claude Code's R9()).
+ */
+function hive_claude_global_config(): string
+{
+    $legacy = hive_claude_config_dir().'/.config.json';
+    if (is_file($legacy) && (int) @filesize($legacy) > 0) {
+        return $legacy;
+    }
+    $explicit = getenv('CLAUDE_CONFIG_DIR');
+    $oauth = getenv('CLAUDE_CODE_CUSTOM_OAUTH_URL');
+
+    return (is_string($explicit) && trim($explicit) !== '' ? hive_normalise_slashes(trim($explicit)) : hive_claude_home())
+        .'/.claude'.(is_string($oauth) && $oauth !== '' ? '-custom-oauth' : '').'.json';
+}
+
+/**
+ * The end of the JSON string that starts at $at in $json (the offset just
+ * past its closing quote), or null when there is none. Pure.
+ */
+function hive_json_string_end(string $json, int $at): ?int
+{
+    if (($json[$at] ?? '') !== '"') {
+        return null;
+    }
+    $at++;
+    while (($quote = strpos($json, '"', $at)) !== false) {
+        $slashes = 0;
+        while ($quote - $slashes - 1 >= $at && $json[$quote - $slashes - 1] === '\\') {
+            $slashes++;
+        }
+        if ($slashes % 2 === 0) {
+            return $quote + 1;
+        }
+        $at = $quote + 1;
+    }
+
+    return null;
+}
+
+/**
+ * The end of the JSON value that starts at $at in $json, or null when it
+ * does not end: a string, an object or array whose brackets pair, no
+ * deeper than HIVE_JSON_DEPTH_MAX, or one bare word or number. Pure.
+ */
+function hive_json_value_end(string $json, int $at): ?int
+{
+    $first = $json[$at] ?? '';
+    if ($first === '"') {
+        return hive_json_string_end($json, $at);
+    }
+    if ($first !== '{' && $first !== '[') {
+        $length = strcspn($json, ",}] \t\r\n", $at);
+
+        return $length > 0 ? $at + $length : null;
+    }
+
+    // The closer each open bracket waits for, by depth: set and read in
+    // place, never copied, so each byte costs the same at any depth.
+    $closers = [];
+    $depth = 0;
+    $length = strlen($json);
+    while ($at < $length) {
+        $at += strcspn($json, '"{}[]', $at);
+        $char = $json[$at] ?? '';
+        if ($char === '"') {
+            $end = hive_json_string_end($json, $at);
+            if ($end === null) {
+                return null;
+            }
+            $at = $end;
+
+            continue;
+        }
+        if ($char === '{' || $char === '[') {
+            if ($depth >= HIVE_JSON_DEPTH_MAX) {
+                return null;
+            }
+            $closers[$depth++] = $char === '{' ? '}' : ']';
+        } elseif ($char === '}' || $char === ']') {
+            if ($depth === 0 || $closers[--$depth] !== $char) {
+                return null;
+            }
+            if ($depth === 0) {
+                return $at + 1;
+            }
+        } else {
+            return null;
+        }
+        $at++;
+    }
+
+    return null;
+}
+
+/**
+ * The values $keys hold at the top of the JSON object $json, the last of a
+ * key named twice as JSON.parse keeps it, a key absent left out; nothing
+ * else of $json is kept. A value longer than 64 bytes reads as null: none
+ * asked for is. Null when $json is not one object, or nests deeper than
+ * HIVE_JSON_DEPTH_MAX, so a broken or absurd file reads as no file. It
+ * walks the object without decoding it, each byte once: the time a file
+ * takes grows with its size alone. Pure.
+ *
+ * @param  list<string>  $keys
+ * @return array<string, mixed>|null
+ */
+function hive_json_top_values(string $json, array $keys): ?array
+{
+    $space = " \t\r\n";
+    $at = strspn($json, $space);
+    if (($json[$at] ?? '') !== '{') {
+        return null;
+    }
+    $at++;
+    $values = [];
+    $first = true;
+    while (true) {
+        $at += strspn($json, $space, $at);
+        if ($first && ($json[$at] ?? '') === '}') {
+            $at++;
+
+            break;
+        }
+        $keyEnd = hive_json_string_end($json, $at);
+        $key = $keyEnd !== null ? json_decode(substr($json, $at, $keyEnd - $at)) : null;
+        if (! is_string($key)) {
+            return null;
+        }
+        $at = $keyEnd + strspn($json, $space, $keyEnd);
+        if (($json[$at] ?? '') !== ':') {
+            return null;
+        }
+        $at++;
+        $at += strspn($json, $space, $at);
+        $end = hive_json_value_end($json, $at);
+        if ($end === null) {
+            return null;
+        }
+        if (in_array($key, $keys, true)) {
+            $raw = substr($json, $at, $end - $at);
+            $value = strlen($raw) <= 64 ? json_decode($raw, true) : null;
+            if (strlen($raw) <= 64 && json_last_error() !== JSON_ERROR_NONE) {
+                return null;
+            }
+            $values[$key] = $value;
+        }
+        $at = $end + strspn($json, $space, $end);
+        $first = false;
+        $next = $json[$at] ?? '';
+        $at++;
+        if ($next === '}') {
+            break;
+        }
+        if ($next !== ',') {
+            return null;
+        }
+    }
+
+    return $at + strspn($json, $space, $at) === strlen($json) ? $values : null;
+}
+
+/**
+ * Does Claude Code's global config, read as $values
+ * (hive_json_top_values() of HIVE_SELF_UPDATE_CONFIG_KEYS), stop its
+ * plugin updates? Yes when autoUpdates is false, unless installMethod is
+ * native and autoUpdatesProtectedForNative is true: what its native
+ * installer writes to keep its old updater from running. Pure.
+ *
+ * @param  array<string, mixed>|null  $values
+ */
+function hive_self_update_config_blocks(?array $values): bool
+{
+    return $values !== null && ($values['autoUpdates'] ?? null) === false
+        && (($values['installMethod'] ?? null) !== 'native' || ($values['autoUpdatesProtectedForNative'] ?? null) !== true);
+}
+
+/**
+ * Does Claude Code's global config on this computer stop its plugin updates
+ * (hive_self_update_config_blocks()), with FORCE_AUTOUPDATE_PLUGINS not on
+ * to let them through? Read only for its three update keys, only when an
+ * attempt is about to be claimed and in doctor, never written, and nothing
+ * of it kept or said: a file missing, unreadable, larger than
+ * HIVE_SELF_UPDATE_CONFIG_MAX or not one JSON object stops nothing. The
+ * answer is kept in <home>/self-update.config.json under the file's place,
+ * inode, size and modified time, and the file read again only when one of
+ * those moved or HIVE_SELF_UPDATE_CONFIG_RECHECK has passed: a computer the
+ * config holds back stays due, and asks at every session start.
+ */
+function hive_self_update_config_off(?int $now = null): bool
+{
+    if (hive_claude_env_on(getenv('FORCE_AUTOUPDATE_PLUGINS'))) {
+        return false;
+    }
+    $path = hive_claude_global_config();
+    clearstatcache(true, $path);
+    $stat = is_file($path) ? @stat($path) : false;
+    if (! is_array($stat)) {
+        return false;
+    }
+
+    $now ??= time();
+    $memo = hive_home().'/self-update.config.json';
+    $key = sha1($path).':'.$stat['ino'].':'.$stat['size'].':'.$stat['mtime'];
+    $kept = hive_read_json($memo);
+    if (is_array($kept) && ($kept['key'] ?? null) === $key && is_bool($kept['blocks'] ?? null) && is_int($kept['at'] ?? null)
+        && $kept['at'] <= $now && $now - $kept['at'] < HIVE_SELF_UPDATE_CONFIG_RECHECK) {
+        return $kept['blocks'];
+    }
+
+    $json = @file_get_contents($path, false, null, 0, HIVE_SELF_UPDATE_CONFIG_MAX + 1);
+    $blocks = is_string($json) && strlen($json) <= HIVE_SELF_UPDATE_CONFIG_MAX && str_contains($json, '"autoUpdates"')
+        && hive_self_update_config_blocks(hive_json_top_values($json, HIVE_SELF_UPDATE_CONFIG_KEYS));
+    // A file it could not read is asked again next time, not remembered.
+    clearstatcache();
+    if (is_string($json) && is_dir(hive_home())) {
+        hive_write_json($memo, ['v' => 1, 'key' => $key, 'at' => $now, 'blocks' => $blocks]);
+    }
+
+    return $blocks;
+}
+
+/**
+ * The velu marketplace as Claude Code knows it, read as Claude Code reads
+ * it: the user settings' extraKnownMarketplaces.velu ($declared) first,
+ * else known_marketplaces.json's velu ($known). `ours`: that entry is Hive's
+ * own (hive_setup_velu_ours(): git, HIVE_PLUGIN_MARKETPLACE_URL).
+ * `auto`: its autoUpdate, true or false, from the settings entry when it
+ * holds the key, else from known_marketplaces.json; null for a key in
+ * neither (as `claude plugin marketplace add` leaves the settings entry) or
+ * one that is no true or false. `pinned`: that autoUpdate is false; null
+ * pins nothing. doctor's `auto-update` row says the same reading. Pure.
+ *
+ * @param  array<string, mixed>|null  $declared
+ * @param  array<string, mixed>|null  $known
+ * @return array{ours: bool, pinned: bool, auto: ?bool}
+ */
+function hive_self_update_marketplace_reading(?array $declared, ?array $known): array
+{
+    $entry = $declared ?? $known;
+    $object = $entry !== null ? json_decode((string) json_encode($entry)) : null;
+
+    $auto = $declared !== null && array_key_exists('autoUpdate', $declared) ? $declared['autoUpdate']
+        : ($known !== null && array_key_exists('autoUpdate', $known) ? $known['autoUpdate'] : null);
+
+    return [
+        'ours' => $object instanceof stdClass && hive_setup_velu_ours($object),
+        'pinned' => $auto === false,
+        'auto' => is_bool($auto) ? $auto : null,
+    ];
+}
+
+/**
+ * hive_self_update_marketplace_reading() of this computer's user settings and known_marketplaces.json.
+ *
+ * @return array{ours: bool, pinned: bool, auto: ?bool}
+ */
+function hive_self_update_marketplace(): array
+{
+    $settings = hive_read_json(hive_claude_config_dir().'/settings.json');
+    $known = hive_read_json(hive_plugin_root_dir().'/known_marketplaces.json');
+    $declared = is_array($settings) && is_array($settings['extraKnownMarketplaces'] ?? null)
+        && is_array($settings['extraKnownMarketplaces'][HIVE_PLUGIN_MARKETPLACE] ?? null)
+        ? $settings['extraKnownMarketplaces'][HIVE_PLUGIN_MARKETPLACE] : null;
+
+    return hive_self_update_marketplace_reading($declared, is_array($known) && is_array($known[HIVE_PLUGIN_MARKETPLACE] ?? null) ? $known[HIVE_PLUGIN_MARKETPLACE] : null);
+}
+
+/**
+ * The folder of the velu marketplace's clone, where Claude Code keeps it:
+ * the installLocation known_marketplaces.json gives velu ($known) when that
+ * is an absolute path ($family's) inside the plugins root $root, with no
+ * part that is empty or only dots and spaces (., .., ..., `.. `); else
+ * <plugins root>/marketplaces/velu, where Claude Code puts it. Pure.
+ *
+ * @param  array<string, mixed>|null  $known
+ */
+function hive_self_update_clone(?array $known, string $root, string $family): string
+{
+    $fixed = $root.'/marketplaces/'.HIVE_PLUGIN_MARKETPLACE;
+    $at = $known['installLocation'] ?? null;
+    if (! is_string($at) || ! hive_self_update_absolute(str_replace('\\', '/', $at), $family)) {
+        return $fixed;
+    }
+    $at = hive_normalise_slashes($at);
+    if (! str_starts_with($at, $root.'/')) {
+        return $fixed;
+    }
+    // Windows drops a name's trailing dots and spaces, so `...` and `.. `
+    // are `..` there: a part that is nothing else is refused everywhere.
+    foreach (explode('/', substr($at, strlen($root) + 1)) as $part) {
+        if (rtrim($part, '. ') === '') {
+            return $fixed;
+        }
+    }
+
+    return $at;
+}
+
+/**
+ * The version of the plugin the velu marketplace's clone holds, as Claude
+ * Code fetched it: plugin/.claude-plugin/plugin.json in the clone
+ * (hive_self_update_clone()), the plugins root found as
+ * installed_plugins.json's is. Null when it is not there or names no
+ * version.
+ */
+function hive_self_update_published(): ?string
+{
+    $root = hive_plugin_root_dir();
+    $known = hive_read_json($root.'/known_marketplaces.json');
+    $clone = hive_self_update_clone(is_array($known) && is_array($known[HIVE_PLUGIN_MARKETPLACE] ?? null) ? $known[HIVE_PLUGIN_MARKETPLACE] : null,
+        $root, PHP_OS_FAMILY);
+    $doc = hive_read_json($clone.'/plugin/.claude-plugin/plugin.json');
+
+    return is_array($doc) ? hive_self_update_plugin_version($doc['version'] ?? null) : null;
+}
+
+/** HIVE_SELF_UPDATE=0 (or off, false, no), in the environment or <home>/.env.hive: this computer's own no. */
+function hive_self_update_opted_out(): bool
+{
+    return in_array(strtolower(trim((string) hive_env('HIVE_SELF_UPDATE', '1'))), ['0', 'off', 'false', 'no'], true);
+}
+
+/** Can this PHP start a program, watch it and end it (HIVE_SELF_UPDATE_PROC, none in disable_functions)? */
+function hive_self_update_can_run(): bool
+{
+    foreach (HIVE_SELF_UPDATE_PROC as $function) {
+        if (! function_exists($function)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Why this computer does not keep its client current by itself, as a key
+ * of hive_self_update_off_words(), or null when it does. Cheapest first:
+ * the run context and state.json's setup, the environment and this PHP, the
+ * policy $cache holds (the owners' switch), then Claude Code's own
+ * switches, its user settings and known_marketplaces.json, and
+ * installed_plugins.json. $cache is the cached picture the caller goes by.
+ *
+ * @param  array<string, mixed>|null  $cache
+ */
+function hive_self_update_off(?array $cache): ?string
+{
+    if (hive_client_channel() !== 'plugin' || hive_setup_mode() !== 'plugin') {
+        return 'channel';
+    }
+    if (hive_self_update_opted_out()) {
+        return 'opt-out';
+    }
+    if (hive_is_disabled()) {
+        return 'disabled';
+    }
+    if (hive_is_dry_run()) {
+        return 'dry-run';
+    }
+    if (hive_env('HIVE_BACKGROUND', '1') !== '1') {
+        return 'inline';
+    }
+    if (! hive_self_update_can_run()) {
+        return 'no-proc';
+    }
+
+    $block = hive_policy_value($cache, 'client', null);
+    if (! is_array($block) || ! is_bool($block['self_update'] ?? null)) {
+        return 'no-word';
+    }
+    if ($block['self_update'] !== true) {
+        return 'switch';
+    }
+
+    $env = getenv();
+    $blocker = hive_self_update_blocker(is_array($env) ? $env : []);
+    if ($blocker !== null) {
+        return 'env:'.$blocker;
+    }
+    $marketplace = hive_self_update_marketplace();
+    if (! $marketplace['ours']) {
+        return 'foreign';
+    }
+    if ($marketplace['pinned']) {
+        return 'pinned';
+    }
+    if (! hive_plugin_recorded()) {
+        return 'recorded';
+    }
+
+    return null;
+}
+
+/** hive_self_update_off()'s reason, or 'config' (hive_self_update_config_off()), in doctor's words. */
+function hive_self_update_off_words(string $why): string
+{
+    if (str_starts_with($why, 'env:')) {
+        return substr($why, 4).' stops plugin updates here, as Claude Code reads it (FORCE_AUTOUPDATE_PLUGINS beside it lets them through)';
+    }
+
+    return [
+        'channel' => 'this computer is not on the plugin route, so its client updates with a paste of the setup prompt from /board -> My access',
+        'opt-out' => 'HIVE_SELF_UPDATE=0 on this computer',
+        'disabled' => 'Hive is off on this computer',
+        'dry-run' => 'HIVE_DRY_RUN=1 starts nothing',
+        'inline' => 'HIVE_BACKGROUND=0, and the update never runs inside a hook',
+        'no-proc' => 'this PHP cannot start or end a program (one of '.implode(', ', HIVE_SELF_UPDATE_PROC).' is disabled)',
+        'config' => 'autoUpdates is false in Claude Code\'s global config, which stops plugin updates here as Claude Code reads it (FORCE_AUTOUPDATE_PLUGINS lets them through)',
+        'no-word' => 'Hive has not said whether it is on (a Hive from before it, or no picture cached here yet)',
+        'switch' => 'Hive\'s owners switched it off, or Hive is paused',
+        'foreign' => 'the velu marketplace Claude Code knows here is not Hive\'s own ('.HIVE_PLUGIN_MARKETPLACE_URL.'), so Hive leaves it alone',
+        'pinned' => 'automatic updates for the velu marketplace are switched off in /plugin -> Marketplaces -> velu, which keeps this version',
+        'recorded' => 'Claude Code records no install of '.HIVE_PLUGIN_ID.' here',
+        'gone' => 'Hive was removed from this computer',
+    ][$why] ?? $why;
+}
+
+/**
+ * Is $path absolute on $family: a slash first, or on Windows a drive
+ * (C:/) or a share (//server/share/), after hive_normalise_slashes()? A
+ * path with a NUL in it is none. Pure.
+ */
+function hive_self_update_absolute(string $path, string $family): bool
+{
+    if ($path === '' || str_contains($path, "\0")) {
+        return false;
+    }
+
+    return $family === 'Windows'
+        ? preg_match('#^(?:[A-Za-z]:/|//[^/]+/[^/]+/)#', $path) === 1
+        : $path[0] === '/';
+}
+
+/**
+ * Where the updater looks for `claude`, in order: $override (HIVE_CLAUDE_BIN)
+ * when it is an absolute path; setup's own list, $setup
+ * (hive_setup_claude_candidates(): PATH's absolute folders, ~/.local/bin,
+ * ~/.claude/local, the editor extensions' newest first, on Windows
+ * claude.exe then claude.cmd and %APPDATA%\npm); then, off Windows,
+ * Homebrew's and /usr/local's. Paths only, each once. Pure.
+ *
+ * @param  list<string>  $setup
+ * @return list<string>
+ */
+function hive_self_update_candidates(string $family, ?string $override, array $setup): array
+{
+    $list = [];
+    $override = $override !== null ? hive_normalise_slashes(trim($override)) : '';
+    if (hive_self_update_absolute($override, $family)) {
+        $list[] = $override;
+    }
+    foreach ($setup as $candidate) {
+        $list[] = $candidate;
+    }
+    if ($family !== 'Windows') {
+        $list[] = '/opt/homebrew/bin/claude';
+        $list[] = '/usr/local/bin/claude';
+    }
+
+    return array_values(array_unique($list));
+}
+
+/** The `claude` the updater runs: the first of hive_self_update_candidates() this computer can start, or null. */
+function hive_self_update_find_claude(): ?string
+{
+    $family = hive_setup_os_family();
+    foreach (hive_self_update_candidates($family, hive_env('HIVE_CLAUDE_BIN'), hive_setup_claude_candidates()) as $candidate) {
+        if (hive_setup_claude_usable($candidate)) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+/** Each command's timeout: HIVE_SELF_UPDATE_TIMEOUT seconds (environment or <home>/.env.hive), 1 to 300, else HIVE_SELF_UPDATE_TIMEOUT_DEFAULT. */
+function hive_self_update_timeout_ms(): int
+{
+    $raw = hive_env('HIVE_SELF_UPDATE_TIMEOUT');
+    $seconds = is_string($raw) && preg_match('/^\d{1,4}$/', trim($raw)) === 1 ? (int) trim($raw) : HIVE_SELF_UPDATE_TIMEOUT_DEFAULT;
+
+    return max(1, min(300, $seconds)) * 1000;
+}
+
+/**
+ * The folder every `claude` of a run starts in: Claude Code's home
+ * (hive_claude_home()), never the repository a session started in, so a
+ * repository's .claude/settings.json is never read; the system's
+ * temporary folder where that home is no folder.
+ */
+function hive_self_update_cwd(): string
+{
+    $home = hive_claude_home();
+
+    return is_dir($home) ? $home : hive_normalise_slashes(sys_get_temp_dir());
+}
+
+/**
+ * The one line kept of what a failed command wrote: the first that is not
+ * blank, stderr first, with terminal colour codes out, $home as ~, the
+ * credentials of an address masked, made safe and held to
+ * HIVE_SELF_UPDATE_SAID_MAX characters ('' for none). Pure.
+ */
+function hive_self_update_said(string $err, string $out, string $home): string
+{
+    foreach (preg_split('/\r\n|\r|\n/', $err."\n".$out) ?: [] as $line) {
+        $line = (string) preg_replace('/\x1B\[[0-9;?]*[ -\/]*[@-~]/', '', $line);
+        if (trim($line) === '') {
+            continue;
+        }
+        if ($home !== '' && $home !== '/') {
+            // As written either way: a Windows command says C:\Users\<you>.
+            $line = str_replace([$home, str_replace('/', '\\', $home)], '~', $line);
+        }
+        $line = (string) preg_replace('#(://)[^/@\s]+@#', '$1***@', $line);
+
+        return hive_self_update_clean($line);
+    }
+
+    return '';
+}
+
+/**
+ * Text a command wrote, made safe for doctor's one line and held to
+ * HIVE_SELF_UPDATE_SAID_MAX characters: hive_safe_text(), then < and > as
+ * [ and ], so nothing in it reads as a tag and no escape pushes it past the
+ * bound. Pure.
+ */
+function hive_self_update_clean(string $text): string
+{
+    return str_replace(['<', '>'], ['[', ']'], hive_safe_text($text, HIVE_SELF_UPDATE_SAID_MAX, false));
+}
+
+/**
+ * Why a run must not go on now, or null: the home is gone (a purge), or the
+ * computer no longer updates itself (hive_self_update_off(), with state.json's
+ * setup read again). Asked before each command.
+ */
+function hive_self_update_stop(): ?string
+{
+    clearstatcache();
+    if (! is_dir(hive_home())) {
+        return 'gone';
+    }
+    hive_setup_mode(true);
+
+    return hive_self_update_off(hive_policy_cache_any());
+}
+
+/**
+ * One run of the two commands, for a claim naming $latest (the verb's part,
+ * under its run lock), every `claude` started in $cwd. Nothing to do when
+ * the installed copy is already $latest or newer (`current`: another
+ * session's run, or Claude Code's own, got there first). No `claude`:
+ * `failed` at `find`, said `binary not found`. Before each command, a
+ * computer that stopped updating itself stops the run (`stopped`). Each
+ * command runs with the environment as it is but for what
+ * hive_self_update_run() set, stdin empty, its timeout, and is ended by its
+ * own pid when it runs past it; the second only once the first exited 0 and
+ * the marketplace's clone holds a version newer than the installed one.
+ * Then: `updated` when the installed version moved; `failed` when the clone
+ * held a newer one and it did not move; else `behind` (the publish is not
+ * out yet). $reached says the step it has reached (`find`, then each
+ * command's), for a run that has to end it on a Throwable.
+ *
+ * @return array{result: string, step: ?string, exit: ?int, timed_out: bool, seconds: int, claude: ?string, said: ?string, to: ?string, published: ?string}
+ */
+function hive_self_update_attempt(string $latest, string $cwd, ?string &$reached = null): array
+{
+    $reached = 'find';
+    $started = microtime(true);
+    $before = hive_plugin_installed_version();
+    $out = ['result' => 'failed', 'step' => null, 'exit' => null, 'timed_out' => false, 'seconds' => 0, 'claude' => null, 'said' => null,
+        'to' => $before, 'published' => null];
+    $took = static fn (): int => (int) round(microtime(true) - $started);
+    $done = static function (array $out, string $result, ?string $step = null, ?string $said = null) use ($took): array {
+        return array_merge($out, ['result' => $result, 'step' => $step, 'said' => $said, 'seconds' => $took()]);
+    };
+
+    if ($before !== null && version_compare($before, $latest, '>=')) {
+        return $done($out, 'current');
+    }
+
+    $claude = hive_self_update_find_claude();
+    if ($claude === null) {
+        return $done($out, 'failed', 'find', 'binary not found');
+    }
+    $out['claude'] = hive_claude_code_version($claude);
+
+    $home = hive_claude_home();
+    $timeoutMs = hive_self_update_timeout_ms();
+    foreach (HIVE_SELF_UPDATE_STEPS as $step => $args) {
+        $reached = $step;
+        $stop = hive_self_update_stop();
+        if ($stop !== null) {
+            return $done($out, 'stopped', $step, hive_self_update_off_words($stop));
+        }
+
+        $run = hive_claude_run($claude, $args, $timeoutMs, $cwd, HIVE_SELF_UPDATE_READ_MAX);
+        if ($run['timed_out'] || $run['code'] !== 0) {
+            $out['exit'] = $run['code'];
+            $out['timed_out'] = $run['timed_out'];
+            $said = hive_self_update_said($run['err'], $run['out'], $home);
+
+            return $done($out, 'failed', $step, $run['timed_out'] ? 'did not finish within '.intdiv($timeoutMs, 1000).' seconds'
+                : ($run['code'] === null ? 'could not be started' : ($said !== '' ? $said : null)));
+        }
+
+        if ($step === 'marketplace') {
+            $out['published'] = hive_self_update_published();
+            if ($out['published'] !== null && version_compare($out['published'], $before ?? '0', '<=')) {
+                return $done($out, 'behind');
+            }
+        }
+    }
+
+    $after = hive_plugin_installed_version();
+    $out['to'] = $after;
+    if ($after !== null && ($before === null || version_compare($after, $before, '>'))) {
+        return $done($out, 'updated');
+    }
+    if ($out['published'] !== null) {
+        $out['exit'] = 0;
+
+        return $done($out, 'failed', 'plugin', 'the velu marketplace holds '.$out['published'].', and claude plugin update left '
+            .($after ?? 'no version').' installed');
+    }
+
+    return $done($out, 'behind');
+}
+
+/**
+ * Session start's part (hive_verb_session_start(), last, after its answer,
+ * beside the launcher's upkeep): start `self-update` detached when the
+ * policy this start just fetched names a newer client
+ * (hive_self_update_latest()) and an attempt is due on this computer
+ * (hive_self_update_due()), this computer updates itself
+ * (hive_self_update_off()), the installed copy is older than that client,
+ * and this process claimed the attempt (hive_self_update_claim()). Never in
+ * a headless run, never from a picture that is not fresh, and never inline:
+ * HIVE_BACKGROUND=0 starts nothing. The only caller: no other hook reaches
+ * it. Deciding costs the cached picture the launcher read too and, only
+ * when it names a newer client, self-update.json; settings,
+ * installed_plugins.json and the claim only when one is due, and Claude
+ * Code's global config (hive_self_update_config_off()) only just before the
+ * claim. No request.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_self_update_upkeep(array $session): void
+{
+    if (hive_client_channel() !== 'plugin' || hive_is_headless() || hive_self_update_opted_out()) {
+        return;
+    }
+
+    $cache = hive_waits_policy($session);
+    if (hive_cache_tier($cache) !== 'fresh') {
+        return;
+    }
+    $latest = hive_self_update_latest($cache, HIVE_VERSION);
+    if ($latest === null) {
+        return;
+    }
+
+    $now = time();
+    if (! hive_self_update_due(hive_self_update_load(), HIVE_VERSION, $now) || hive_self_update_off($cache) !== null) {
+        return;
+    }
+    $installed = hive_plugin_installed_version();
+    if ($installed !== null && version_compare($installed, $latest, '>=')) {
+        return;
+    }
+    if (hive_self_update_config_off()) {
+        return;
+    }
+
+    if (hive_self_update_claim($latest, $now)) {
+        hive_spawn_background(['self-update']);
+    }
+}
+
+/**
+ * The line a plugin session start says once after the updater brought a
+ * newer client (hive_plugin_session_upkeep(), in its <hive-client> block),
+ * at the first start that runs it, and taken under the lock so two starts
+ * at once say it once between them. Null when there is nothing to say: no
+ * update, one said already, or a start still running an older copy. A run
+ * that failed is never said here: doctor says it, from the second in a row.
+ */
+function hive_self_update_note(): ?string
+{
+    $to = hive_self_update_load()['note']['to'] ?? null;
+    if (! is_string($to) || version_compare(HIVE_VERSION, $to, '<')) {
+        return null;
+    }
+
+    $taken = hive_self_update_mutate(static function (?array $record): ?array {
+        if ($record === null || $record['note'] === null) {
+            return null;
+        }
+        $record['note'] = null;
+
+        return $record;
+    }, HIVE_LOCK_STUCK_WAIT);
+
+    return $taken ? 'Hive updated itself in the background, with no paste: this session runs client '.HIVE_VERSION.'.' : null;
+}
+
+/**
+ * Is a `self-update` running in $home now: its run lock held by another
+ * process? Asked without making the file, and without waiting. purge
+ * (hive_verb_purge()) removes nothing meanwhile.
+ */
+function hive_self_update_running(string $home): bool
+{
+    $path = $home.'/self-update.run.lock';
+    if (! is_file($path)) {
+        return false;
+    }
+    $lock = @fopen($path, PHP_OS_FAMILY === 'Windows' ? 'r' : 're');
+    if (! is_resource($lock)) {
+        return false;
+    }
+    $wouldBlock = 0;
+    $free = @flock($lock, LOCK_EX | LOCK_NB, $wouldBlock);
+    if ($free) {
+        @flock($lock, LOCK_UN);
+    }
+    @fclose($lock);
+
+    return ! $free && ((int) $wouldBlock === 1 || PHP_OS_FAMILY === 'Windows');
+}
+
+/**
+ * purge's refusal while a `self-update` holds its run lock in $home: how
+ * long ago the run took its claim, else the claim was made (that home's
+ * self-update.json), and, once that is past HIVE_SELF_UPDATE_CLAIM_TTL,
+ * longer than any run takes, that a process holds the lock until it ends or
+ * the computer restarts.
+ */
+function hive_self_update_purge_words(string $home, int $now): string
+{
+    $record = hive_self_update_shape(hive_read_json($home.'/self-update.json'));
+    $at = $record !== null && $record['result'] === null && $record['started_at'] <= $now + HIVE_SELF_UPDATE_SKEW
+        ? (is_int($record['run_at'] ?? null) ? $record['run_at'] : (int) $record['started_at']) : null;
+    $what = 'Hive is updating its plugin on this computer in the background (claude plugin update '.HIVE_PLUGIN_ID.')';
+
+    if ($at === null) {
+        return $what.'. Purge removes Hive once that has ended.';
+    }
+    if ($now - $at > HIVE_SELF_UPDATE_CLAIM_TTL) {
+        return $what.', started '.hive_ago($now - $at).' ago, and a process still holds its lock, longer than any update takes. '
+            .'Purge removes Hive once that process has ended, or after the computer restarts.';
+    }
+
+    return $what.', started '.hive_ago(max(0, $now - $at)).' ago. Purge removes Hive once that has ended, within a few minutes.';
+}
+
+/**
+ * `self-update`: started detached by a plugin session start that claimed an
+ * attempt (hive_self_update_upkeep()). It runs only on that claim
+ * (hive_self_update_runnable()) while this computer still updates itself
+ * (hive_self_update_off()), and only with self-update.run.lock, waited for
+ * HIVE_SELF_UPDATE_RUN_WAIT at most, so another process's instant probe of
+ * it never costs the claim: a second copy whose first holds it for longer,
+ * a home it cannot write and a file system that locks nothing all run
+ * nothing. Holding it, it takes the claim (run_at,
+ * under self-update.lock) only if it is still that claim, unfinished and
+ * never taken: another copy may have run it meanwhile, or taken it and been
+ * ended mid-command, so a claim is run once at most. It moves to Claude Code's home folder, and every
+ * `claude` it starts gets this environment but CLAUDE_PROJECT_DIR, with git
+ * told never to ask (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=never). Then
+ * one attempt (hive_self_update_attempt()), its outcome written onto that
+ * claim by its id, never over a newer one, and one line in progress.log:
+ * words and numbers, never what a command said. Nothing is written once
+ * the home is gone. Exit 0, whatever happens: nobody reads it.
+ */
+function hive_verb_self_update(): int
+{
+    try {
+        hive_self_update_run(time());
+    } catch (Throwable $e) {
+        // Fails open, silently: a detached run has nobody to tell.
+    }
+
+    return 0;
+}
+
+/**
+ * Take claim $id for this run at $now, under self-update.lock (waited for
+ * HIVE_STATE_LOCK_WAIT, so another process's moment on it never costs the
+ * claim), only while it is still that very claim, unfinished, never taken,
+ * young enough and not ahead of the clock (hive_self_update_runnable()):
+ * another copy may have run it meanwhile, or taken it and been ended
+ * mid-command, its `claude` perhaps still going. Writes run_at. True when
+ * this process took it; a claim taken is never run again.
+ */
+function hive_self_update_take(string $id, int $now): bool
+{
+    return hive_self_update_mutate(static function (?array $record) use ($id, $now): ?array {
+        if (! hive_self_update_runnable($record, $id, $now)) {
+            return null;
+        }
+        $record['run_at'] = $now;
+
+        return $record;
+    }, HIVE_STATE_LOCK_WAIT);
+}
+
+function hive_self_update_run(int $now): void
+{
+    $claim = hive_self_update_load();
+    if (! hive_self_update_runnable($claim, null, $now) || hive_self_update_off(hive_policy_cache_any()) !== null) {
+        return;
+    }
+
+    $cwd = hive_self_update_cwd();
+    @chdir($cwd);
+    putenv('CLAUDE_PROJECT_DIR');
+    putenv('GIT_TERMINAL_PROMPT=0');
+    putenv('GCM_INTERACTIVE=never');
+
+    $lock = @fopen(hive_home().'/self-update.run.lock', hive_self_update_lock_mode());
+    if (! is_resource($lock)) {
+        return;
+    }
+    if (hive_flock_within($lock, HIVE_SELF_UPDATE_RUN_WAIT, 'self-update-run') !== 'held') {
+        @fclose($lock);
+
+        return;
+    }
+
+    try {
+        $id = (string) $claim['id'];
+        if (! hive_self_update_take($id, time())) {
+            return;
+        }
+
+        // Whatever the attempt throws ends it as a failure at the step it
+        // had reached, said by the exception's class alone: a claim this
+        // run took is always finished, never left as one a kill left.
+        $step = null;
+        $began = microtime(true);
+        try {
+            $outcome = hive_self_update_attempt((string) $claim['latest'], $cwd, $step);
+        } catch (Throwable $e) {
+            $outcome = ['result' => 'failed', 'step' => $step ?? 'find', 'exit' => null, 'timed_out' => false,
+                'seconds' => (int) round(microtime(true) - $began), 'claude' => null, 'said' => 'Hive itself stopped ('.get_class($e).')',
+                'to' => null, 'published' => null];
+        }
+        hive_self_update_mutate(static function (?array $record) use ($id, $outcome): ?array {
+            return $record !== null && $record['id'] === $id && $record['result'] === null
+                ? hive_self_update_finished($record, $outcome, time())
+                : null;
+        }, HIVE_STATE_LOCK_WAIT);
+
+        clearstatcache();
+        if (is_dir(hive_home())) {
+            hive_progress_log('self_update', [
+                'result' => $outcome['result'],
+                'step' => $outcome['step'] ?? 'none',
+                'exit' => $outcome['exit'] ?? 'none',
+                'timed_out' => $outcome['timed_out'] ? 1 : 0,
+                'seconds' => $outcome['seconds'],
+            ]);
+        }
+    } finally {
+        @flock($lock, LOCK_UN);
+        @fclose($lock);
+    }
+}
+
+/**
+ * doctor's rows on the self-update: `self-update`, on or off and why, with
+ * the newest client Hive named, and, on a plugin machine that tried once,
+ * `self-update run`, how the last attempt went (hive_doctor_self_update_run()).
+ *
+ * @return list<array{0: string, 1: string, 2: string}>
+ */
+function hive_doctor_self_update(): array
+{
+    $cache = hive_policy_cache_any();
+    $off = hive_self_update_off($cache) ?? (hive_self_update_config_off() ? 'config' : null);
+    $latest = hive_self_update_latest($cache, HIVE_VERSION);
+
+    $rows = [['self-update', 'ok', $off !== null
+        ? 'off: '.hive_self_update_off_words($off)
+        : 'on: when Hive names a newer client'.($latest !== null ? ' (it names '.$latest.')' : ' (it names none newer than '.HIVE_VERSION.')')
+            .', a session start runs claude plugin marketplace update velu and claude plugin update '.HIVE_PLUGIN_ID
+            .' in the background: at the first start after the news, then at most every 6 hours, every 1 to 6 hours while the plugin is'
+            .' not published yet, and once a day after two failures; HIVE_SELF_UPDATE=0 turns it off here']];
+
+    $record = hive_self_update_load();
+    if ($record !== null && $off !== 'channel') {
+        $rows[] = hive_doctor_self_update_run($record, time(), $record['result'] === null && hive_self_update_running(hive_home()));
+    }
+
+    return $rows;
+}
+
+/**
+ * doctor's `self-update run` row for $record at $now: when the last attempt
+ * started, what came of it, and when the next may start. ok, also after one
+ * failure; WARN once HIVE_SELF_UPDATE_FAILURES failed in a row, or once the
+ * marketplace has held nothing newer for HIVE_SELF_UPDATE_BEHIND_WARN: the
+ * one place either is ever said. A claim dated ahead of the clock (it moved
+ * back) is said as that, never as a wait of years. An unfinished claim whose
+ * run lock a process still holds ($held, hive_self_update_running()) longer
+ * than HIVE_SELF_UPDATE_CLAIM_TTL, counted from when the run took it
+ * (run_at), else from the claim, is WARN: that process outlived any run, and
+ * holds every attempt and purge back until it ends. One a run took whose
+ * lock nobody holds was ended mid-run: never run again, a failure in a row
+ * (hive_self_update_failures()), WARN from the second. A run that stopped
+ * on a Throwable is a failure said by its class. Pure but for the words'
+ * clock.
+ *
+ * @param  array<string, mixed>  $record  hive_self_update_shape()'s
+ * @return array{0: string, 1: string, 2: string}
+ */
+function hive_doctor_self_update_run(array $record, int $now, bool $held = false): array
+{
+    $at = (int) $record['started_at'];
+    if ($at > $now + HIVE_SELF_UPDATE_SKEW) {
+        return ['self-update run', 'ok', 'the last attempt is dated after this computer\'s clock, which has moved back; the next session start that hears of a newer client makes a new one'];
+    }
+
+    $ago = hive_ago(max(0, $now - $at)).' ago';
+    $wait = hive_self_update_next_at($record) - $now;
+    $next = $wait > 0 ? 'the next may start in '.hive_ago($wait) : 'the next may start at the next session start';
+    $with = is_string($record['claude']) ? ' with claude '.$record['claude'] : '';
+    $took = is_int($record['seconds']) ? ' in '.$record['seconds'].' s' : '';
+    $to = is_string($record['to']) ? $record['to'] : 'an unknown version';
+
+    switch ($record['result']) {
+        case null:
+            // How long the lock has been held: from when the run took the
+            // claim, else from the claim, so a run that took it late is not
+            // said to be stuck.
+            $since = is_int($record['run_at'] ?? null) ? $record['run_at'] : $at;
+            if ($held && $now - $since > HIVE_SELF_UPDATE_CLAIM_TTL) {
+                return ['self-update run', 'WARN', 'a process still holds the self-update lock (started '.hive_ago(max(0, $now - $since))
+                    .' ago); no attempt can start and purge waits until it ends or the computer restarts'];
+            }
+            if (! $held && hive_self_update_unfinished($record)) {
+                $failures = hive_self_update_failures($record);
+
+                return ['self-update run', $failures >= HIVE_SELF_UPDATE_FAILURES ? 'WARN' : 'ok', 'started '.$ago.' for '
+                    .($record['latest'] ?? 'a newer client').', and its run was ended before it finished'
+                    .($failures > 1 ? ', '.$failures.' failures in a row' : '').'; '.$next];
+            }
+
+            return ['self-update run', 'ok', 'started '.$ago.' for '.($record['latest'] ?? 'a newer client')
+                .($held || $now - $at <= HIVE_SELF_UPDATE_CLAIM_TTL ? ', still running; ' : ', and never finished; ').$next];
+        case 'updated':
+            return ['self-update run', 'ok', 'last run '.$ago.': updated to '.$to.$took.$with.'; '.$next];
+        case 'current':
+            return ['self-update run', 'ok', 'last run '.$ago.': '.$to.' was installed already; '.$next];
+        case 'stopped':
+            return ['self-update run', 'ok', 'last run '.$ago.' stopped before claude '
+                .implode(' ', HIVE_SELF_UPDATE_STEPS[$record['step'] === 'plugin' ? 'plugin' : 'marketplace']).': '
+                .(is_string($record['said']) ? $record['said'] : 'this computer stopped updating itself').'; '.$next];
+        case 'behind':
+            $since = is_int($record['behind_since']) ? $record['behind_since'] : $at;
+            $long = $now - $since >= HIVE_SELF_UPDATE_BEHIND_WARN;
+
+            return ['self-update run', $long ? 'WARN' : 'ok', 'last run '.$ago.': the velu marketplace held '
+                .(is_string($record['published']) ? $record['published'] : 'nothing newer than '.$to).' (Hive named '
+                .($record['latest'] ?? 'a newer client').', which its deploy publishes last)'
+                .($long ? ', and has for '.hive_ago($now - $since) : '').'; '.$next];
+    }
+
+    if (is_string($record['said']) && str_starts_with($record['said'], 'Hive itself stopped')) {
+        $what = $record['said'].($record['step'] === 'find' ? ' before any claude command'
+            : ' during claude '.implode(' ', HIVE_SELF_UPDATE_STEPS[$record['step'] === 'plugin' ? 'plugin' : 'marketplace']));
+    } elseif ($record['step'] === 'find') {
+        $what = 'no claude command was found (HIVE_CLAUDE_BIN, PATH, ~/.local/bin, ~/.claude/local, an editor extension, Homebrew)';
+    } else {
+        $command = 'claude '.implode(' ', HIVE_SELF_UPDATE_STEPS[$record['step'] === 'plugin' ? 'plugin' : 'marketplace']);
+        $said = is_string($record['said']) && $record['said'] !== '' ? $record['said'] : null;
+        $what = $command.($record['timed_out']
+            ? ' '.($said ?? 'did not finish in time')
+            : ' failed'.(is_int($record['exit']) ? ' (exit '.$record['exit'].')' : '').($said !== null ? ': '.$said : ''));
+    }
+    $failures = (int) $record['failures'];
+    $warn = $failures >= HIVE_SELF_UPDATE_FAILURES;
+
+    return ['self-update run', $warn ? 'WARN' : 'ok', 'last run '.$ago.$with.' failed'.($failures > 1 ? ', '.$failures.' in a row' : '').': '.$what.'; '.$next
+        .($warn ? ' -- the same command run by hand in a terminal says more' : '')];
 }
 
 // =============================================================================
