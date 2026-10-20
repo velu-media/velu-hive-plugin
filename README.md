@@ -12,7 +12,13 @@ by the next release.
 
 Hive's setup (the prompt on your Hive page) installs it; nothing else does.
 Claude Code then keeps it up to date, unless that is switched off in
-`/plugin`.
+`/plugin`. When Hive names a newer release, the client also runs Claude
+Code's own two commands for it in the background (`claude plugin
+marketplace update velu`, then `claude plugin update velu-hive@velu`):
+at the first session start after the news, then at most every six
+hours, every one to six while the release is not published here yet,
+and once a day after two failures. `HIVE_SELF_UPDATE=0` turns that off
+on one computer.
 
 Problems go to the Velu Hive owner, with what `doctor` from Hive's client
 prints.
