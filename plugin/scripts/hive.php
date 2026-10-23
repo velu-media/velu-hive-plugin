@@ -396,7 +396,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.23.0';
+const HIVE_VERSION = '1.24.0';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1399,6 +1399,48 @@ const HIVE_ASKED_EPISODE = 'asked:';
 const HIVE_WOKEN_MAX = 200;
 
 /*
+| Client 1.24.0: how many heads-up marks a session file keeps (`heads_up`,
+| hive_gate_heads_up()): a teammate's claim told at the gate, and a file
+| and teammate told at the gate or the flush, each its own mark. Past it a
+| teammate's file marks are folded into their one wide mark, never
+| dropped (hive_heads_up_bound()), so nothing is said twice.
+*/
+const HIVE_HEADS_UP_MAX = 200;
+
+/*
+| Client 1.24.0: past this many files of one teammate in one repository --
+| the marks the session holds of them and the files a flush note adds -- the
+| session remembers that teammate's files there as a whole -- one mark, the
+| latest `since` said (hive_heads_up_wide_mark()) -- not a mark a file: a
+| pair sharing hundreds of files would otherwise fill HIVE_HEADS_UP_MAX at
+| once, and so would a claim that grows a few files at every publish.
+*/
+const HIVE_HEADS_UP_WIDE = 20;
+
+/*
+| Client 1.24.0: why a heads-up is information, said once a session, by the
+| first heads-up line the session hears (the gate's or the flush's): %s is
+| "it", or "those files" for a note of several.
+*/
+const HIVE_HEADS_UP_WHY = 'Hive holds %s for neither of you; git merges most such changes and reports a conflict only where you both changed the same lines.';
+
+/*
+| Client 1.24.0: the most heads-up lines broker-gate.json counts for one
+| heartbeat (hive_heads_up_count()): Hive's GateReport::COUNT_MAX, past
+| which it reads the count as none.
+*/
+const HIVE_HEADS_UP_COUNT_MAX = 10_000;
+
+/*
+| Client 1.24.0: how far apart, in seconds, Hive's freeing of a wait and its
+| notice of a heads-up release may be for the notice to speak for it
+| (hive_waits_freed_by_heads_up()). One release frees every wait of its run
+| at one moment and sends its notices then; a wait freed `dropped` any other
+| time was freed by something else.
+*/
+const HIVE_HEADS_UP_FREED_WITHIN = 300;
+
+/*
 | How many hashes of files and folders an edit tool changed a repository's
 | state keeps (`touched`, hive_touched_add()). Since hunt 7 (K5) the files a
 | shell command wrote count against it too (hive_touched_written()), at most
@@ -1439,9 +1481,11 @@ const HIVE_CHECK_REASONS = [
     'same_file_exclusive', 'migration_same_table', 'duplicate_migration_timestamp', 'branch_divergence',
     'self_overlap', 'same_machine', 'rename_vs_write', 'truncated_claim_folder', 'stranded_task',
 ];
+// Client 1.24.0: `concurrent_edit`, two people changing one file where the
+// owners' same-file switch makes that a heads-up (Hive 2.13.0, release D).
 const HIVE_CHECK_DAMPENINGS = [
     'ignored_path', 'merge_friendly', 'routine_path', 'collaborating_same_branch', 'previously_acknowledged',
-    'different_target_branch', 'high_churn_path', 'different_files', 'their_claim_expired',
+    'different_target_branch', 'high_churn_path', 'different_files', 'their_claim_expired', 'concurrent_edit',
 ];
 const HIVE_CLAIM_STATUSES = ['active', 'idle', 'stale', 'paused', 'abandoned', 'pushed', 'merged'];
 
@@ -4011,6 +4055,24 @@ function hive_session_merge_save(string $sessionId, array $session): array
             if (is_array($disk[$key] ?? null)) {
                 $session[$key] = array_slice(array_replace($disk[$key], is_array($session[$key] ?? null) ? $session[$key] : []), -HIVE_WOKEN_MAX, null, true);
             }
+        }
+
+        // What the session was last told of the owners' same-file switch
+        // (client 1.24.0, `same_file_said`): written to the file itself, at
+        // session start and by the flush that says it, so the file's word
+        // stands, its absence included.
+        if (array_key_exists('same_file_said', $disk)) {
+            $session['same_file_said'] = $disk['same_file_said'];
+        } else {
+            unset($session['same_file_said']);
+        }
+
+        // The heads-up marks (client 1.24.0), kept both as `noted` is, but
+        // the file's value of a mark wins: the gate and the flush write the
+        // file itself, under this lock, each time they mark one, so a copy
+        // read before them never holds the newer word on it.
+        if (is_array($disk['heads_up'] ?? null)) {
+            $session['heads_up'] = hive_heads_up_bound(array_replace(is_array($session['heads_up'] ?? null) ? $session['heads_up'] : [], $disk['heads_up']));
         }
 
         // The let-go records are the file's (fix round 3, D1): the copy's
@@ -10543,6 +10605,7 @@ function hive_policy_apply(array $policy): void
         $current = is_array($cache['policy'] ?? null) ? $cache['policy'] : [];
         if ($policy !== $current || isset($cache['paused_until'])) {
             $cache['policy'] = $policy;
+            $cache['policy_at'] = time();
             unset($cache['paused_until']);
             hive_write_json($file, $cache);
         }
@@ -12202,12 +12265,18 @@ function hive_session_start_single(string $sessionId, array $session, string $re
             ]);
         }
 
+        // This start told the agent nothing of the owners' same-file switch.
+        hive_same_file_unsaid($sessionId);
+
         return;
     }
 
     // The client's own note on how to reach its verbs, after the block:
     // outside its token budget, and only while Hive is live here.
     $hint = hive_render_client_hint([$cache], hive_session_base($session));
+    if ($hint === null) {
+        hive_same_file_unsaid($sessionId);
+    }
 
     hive_emit([
         'hookSpecificOutput' => [
@@ -12309,9 +12378,14 @@ function hive_session_start_workspace(string $sessionId, array $session, array $
     // Client 1.14.0: a resumed session's note first, outside <hive>.
     $context = $context !== null ? hive_prompt_first($context) : (hive_prompt_first('') !== '' ? hive_prompt_first('') : null);
 
+    // After </hive>, outside its budget: see hive_render_client_hint(). A
+    // start with no note says nothing of the owners' same-file switch.
+    $hint = $context !== null ? hive_render_client_hint(array_column($entries, 'cache'), hive_session_base($session)) : null;
+    if ($hint === null) {
+        hive_same_file_unsaid($sessionId);
+    }
+
     if ($context !== null) {
-        // After </hive>, outside its budget: see hive_render_client_hint().
-        $hint = hive_render_client_hint(array_column($entries, 'cache'), hive_session_base($session));
         if ($hint !== null) {
             $context .= "\n".$hint;
         }
@@ -13128,7 +13202,10 @@ function hive_spawn_background(array $args): bool
  *      one about a pairing partner, from a picture scored while this
  *      checkout was on another branch (hive_gate_verdict_moved()), as
  *      before: the path is not on the server's low_signal_paths nor on the
- *      snapshot's quiet_paths, and 8 holds
+ *      snapshot's quiet_paths, and 8 holds. Client 1.24.0: a file Hive
+ *      scored a heads-up (the claim's `heads_up_hashes`) stays below there
+ *      while the policy says same-file edits are a heads-up in this
+ *      repository
  *   5. we have not already asked about this path in this session
  *   6. the session is interactive
  *   7. the server's policy asks: ask, deny or a value it does not know (off
@@ -13180,6 +13257,21 @@ function hive_verb_pre_edit(): int
  * cap (hive_broker_gate_cut()), whose path Hive's ruling is not read for. What
  * it writes is what the verb writes: `asked` in the session file, a stamp
  * in the cache, the broker gate's counts.
+ *
+ * Client 1.24.0: a warning about a file Hive scored a heads-up, where the
+ * policy says same-file edits are a heads-up in its repository, carries a
+ * line for the agent beside it (hookSpecificOutput.additionalContext, no
+ * decision): a teammate is changing the file too, and Hive holds it for
+ * neither of them (hive_gate_heads_up()). Not beside Hive's word on the
+ * file -- a ruling made before the owners flipped the switch, until Hive
+ * withdraws it, or the developer's override of one -- which the line would
+ * contradict, and not for a cut payload. Once per teammate claim a
+ * session, at its first file the agent edits, and its marks in the session
+ * file's `heads_up`: a claim of hundreds of files would otherwise put a
+ * line in the agent's context at every edit, and the flush's grouped note
+ * says the rest of its files after the publish. The developer's
+ * systemMessage is 1.23.0's, word for word, so a Claude Code that drops the
+ * context still shows them the line.
  *
  * @param  array<string, string>  $input
  * @return array<string, mixed>|null
@@ -13369,6 +13461,25 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
     // is not quiet for them or a pairing partner's, and not raised with
     // them already: a reminder at every edit is not a new question.
     $warned = $interactive && $found['verdict'] !== 'quiet' && empty($found['pairing']) && ! $alreadyAsked && ! $raised;
+    // Client 1.24.0: beside a warning, a teammate changing this file too,
+    // where Hive calls it a heads-up, told to the agent once per teammate
+    // claim (hive_gate_heads_up()). Not where Hive's word on the file speaks
+    // -- a ruling, or the developer's override of one, which "Hive holds it
+    // for neither of you" would contradict -- nor for a path scanned out of
+    // a cut payload, which may only ever make the gate say less and keeps
+    // no agent_id to tell a sub-agent by. An error tells nothing, as 1.23.0.
+    $headsUp = static function () use ($sessionId, $session, $input, $cache, $found, $repo, $relative, $hash, $label, $broker, $cut): array {
+        if ($broker !== null || $cut) {
+            return [];
+        }
+        try {
+            $line = hive_gate_heads_up((string) $sessionId, $session, $input, $cache, $found, $repo, $relative, $hash, $label.$relative);
+        } catch (Throwable $e) {
+            $line = null;
+        }
+
+        return $line === null ? [] : ['hookSpecificOutput' => ['hookEventName' => 'PreToolUse', 'additionalContext' => $line]];
+    };
 
     if ($broker !== null && $broker['decision'] === 'warn') {
         if ($warned) {
@@ -13449,7 +13560,7 @@ function hive_pre_edit_payload(array $input, bool $cut = false): ?array
         return $finish([
             'systemMessage' => 'HIVE '.$dash.' '.$detail
                 .($reason === [] ? '' : ' ['.implode('; ', $reason).']'),
-        ]);
+        ] + $headsUp());
     }
 
     // Remember, so the second edit to the same file does not prompt again. A
@@ -13717,6 +13828,12 @@ function hive_asked_episode($recorded, $at, ?string $claimId, int $now): bool
  * (hive_gate_verdict_moved()): only what the branch decides is set aside
  * and read by 1.8.0's rules, and what the kind of file or the teammate's
  * own claim decides stands (open item 3 of the verification fixes).
+ * Client 1.24.0: a file Hive scored a heads-up (the claim's
+ * `heads_up_hashes`) stays below while the policy says same-file edits are
+ * a heads-up in this repository (hive_same_file_mode(), read once, and only
+ * for such a picture): two people changing one file is a heads-up on any
+ * branch. Every other file below is set aside as before, a pairing
+ * partner's among them, which the new branch may make hard.
  *
  * @param  array<string, mixed>  $cache
  * @param  callable(): array{branch: ?string, target: ?string}  $mine
@@ -13730,6 +13847,7 @@ function hive_gate_find(array $cache, string $relative, string $hash, callable $
     $integration = hive_cache_integration_branches($cache);
     $where = null;
     $elsewhere = null;
+    $headsUp = null;
 
     foreach ((array) ($cache['claims'] ?? []) as $claim) {
         // The developer's own claim on another lane of their workplan is a
@@ -13747,7 +13865,15 @@ function hive_gate_find(array $cache, string $relative, string $hash, callable $
             $where = $where ?? $mine();
             $elsewhere = $elsewhere ?? hive_picture_scored_elsewhere($cache, $where['branch']);
             if ($elsewhere) {
-                $verdict = hive_gate_verdict_moved($claim, $verdict, $where, $integration);
+                // Read for a file below hard only: a hard one is decided as before.
+                if ($headsUp === null && $verdict === 'below') {
+                    try {
+                        $headsUp = hive_same_file_mode($cache) === 'heads_up';
+                    } catch (Throwable $e) {
+                        $headsUp = false; // 1.23.0's moved verdicts
+                    }
+                }
+                $verdict = hive_gate_verdict_moved($claim, $verdict, $where, $integration, $headsUp ?? false, $hash);
             }
         }
 
@@ -13801,6 +13927,18 @@ function hive_picture_scored_elsewhere(array $cache, ?string $branch): bool
  *               here. Someone who switched from a hotfix to develop and
  *               edited at once was otherwise only warned about a file hard
  *               for them on develop, until their next publish.
+ *               Client 1.24.0: kept for a file in the claim's
+ *               `heads_up_hashes` while $headsUp, that the policy says
+ *               same-file edits are a heads-up in this repository
+ *               (hive_same_file_mode()): Hive scored it soft because two
+ *               people change it, which no branch changes, so a heads-up
+ *               file is no longer asked about once after `git checkout
+ *               -b`. Only for those files: a pairing partner's file, an
+ *               exclusive claim's that gave way to one, an owner-guarded
+ *               file a pair shares are below for the pair alone and may be
+ *               hard on the new branch. In hold, or for a repository on
+ *               the hold list, set aside as before: the picture may be
+ *               older than the switch.
  *   hard        kept, but for a pairing partner on the branch this
  *               checkout is on now (hive_claim_is_pairing()) whose claim is
  *               not one of deletions: the server caps a pair at advisory,
@@ -13831,11 +13969,17 @@ function hive_picture_scored_elsewhere(array $cache, ?string $branch): bool
  * @param  array<string, mixed>  $claim
  * @param  array{branch: ?string, target: ?string}  $where
  * @param  list<string>|null  $integration  hive_cache_integration_branches()
+ * @param  bool  $headsUp  hive_same_file_mode() says heads-up for this repository
+ * @param  string  $hash  the file's path hash, for `heads_up_hashes`
  */
-function hive_gate_verdict_moved(array $claim, string $verdict, array $where, ?array $integration): ?string
+function hive_gate_verdict_moved(array $claim, string $verdict, array $where, ?array $integration, bool $headsUp = false, string $hash = ''): ?string
 {
     if ($verdict === 'below') {
-        return null;
+        try {
+            return $headsUp && hive_claim_heads_up($claim, $hash) ? 'below' : null;
+        } catch (Throwable $e) {
+            return null; // set aside, as 1.23.0 does
+        }
     }
 
     if ($verdict === 'hard' && hive_claim_deleting($claim) === null
@@ -13944,6 +14088,328 @@ function hive_claim_gate_verdict(array $claim, string $hash): ?string
     }
 
     return is_array($claim['structural_hashes'] ?? null) && $in($claim['structural_hashes']) ? 'structural' : 'below';
+}
+
+/**
+ * Client 1.24.0: whether Hive scored this file of a teammate's claim a
+ * heads-up for you: in the claim's `heads_up_hashes`, the files it scored
+ * soft because two people change them (`concurrent_edit`), which Hive
+ * lists only for clients 1.24.0 and newer, matched as
+ * hive_claim_gate_verdict() matches. False without the key: a server
+ * before it, or a claim with no such file.
+ *
+ * @param  array<string, mixed>  $claim
+ */
+function hive_claim_heads_up(array $claim, string $hash): bool
+{
+    if ($hash === '' || ! is_array($claim['heads_up_hashes'] ?? null)) {
+        return false;
+    }
+
+    foreach ($claim['heads_up_hashes'] as $candidate) {
+        if (is_string($candidate) && strcasecmp($candidate, $hash) === 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Client 1.24.0: how the owners' same-file switch stands for this cache's
+ * repository, from the policy's `collision` block, which Hive serves
+ * clients 1.24.0 and newer: `hold` when the switch says hold or the
+ * repository is on its hold list, `heads_up` when it says heads-up and the
+ * repository is not listed. The repository is the cache's own (`repo`),
+ * named as the list names it: its last part, lower case, as
+ * RemoteName::slugOf() names it. Null, so nothing is said that 1.23.0
+ * would not say, for no cache, no block (a server before it), a word this
+ * client does not know, a hold list that is no list of names, or a cache
+ * that does not name its repository. Pure: reads the cache, nothing else.
+ *
+ * @param  array<string, mixed>|null  $cache
+ */
+function hive_same_file_mode(?array $cache): ?string
+{
+    $block = hive_policy_value($cache, 'collision', null);
+    if (! is_array($block)) {
+        return null;
+    }
+
+    $mode = $block['same_file'] ?? null;
+    if ($mode !== 'heads_up' && $mode !== 'hold') {
+        return null;
+    }
+
+    $held = $block['same_file_hold_repos'] ?? [];
+    if (! is_array($held) || ! array_is_list($held)) {
+        return null;
+    }
+    foreach ($held as $name) {
+        if (! is_string($name)) {
+            return null;
+        }
+    }
+
+    $repo = hive_str($cache['repo'] ?? null);
+    if ($repo === null || $repo === '') {
+        return null;
+    }
+    if ($mode === 'hold') {
+        return 'hold';
+    }
+
+    $slug = strtolower(hive_broker_repo_name($repo));
+    foreach ($held as $name) {
+        if (strtolower(trim($name)) === $slug) {
+            return 'hold';
+        }
+    }
+
+    return 'heads_up';
+}
+
+/**
+ * Client 1.24.0: what the gate tells the agent, as information, when a
+ * teammate is changing the file this edit changes too and Hive calls that
+ * a heads-up -- additionalContext beside the developer's one-line warning,
+ * with no decision -- or null to say no more than 1.23.0 says. Only where
+ * two facts agree: the policy says same-file edits are a heads-up in this
+ * repository (hive_same_file_mode()), and Hive scored this file of the
+ * teammate's claim a heads-up for this developer (its `heads_up_hashes`).
+ * Never about a pairing partner, a quiet, structural or hard file, a claim
+ * Hive did not score or one with no ulid, while Hive is silent, or inside a
+ * sub-agent, whose words never reach the main agent (B9): nothing is
+ * marked there either, so the main agent hears it at its own edit. The
+ * gate asks for it only where Hive's word on the file does not speak and
+ * the payload was read whole (hive_pre_edit_payload()).
+ *
+ * Once per teammate claim a session: the first file of a claim the agent
+ * edits is told, and a later one reaches it in the flush's grouped note
+ * after the publish, so a claim of hundreds of files puts one line in the
+ * agent's context, not one at every edit. A file the session heard of from
+ * that teammate already, in a flush's note, is not told again either. The
+ * marks -- the claim's (hive_heads_up_claim_mark()) and the file's
+ * (hive_heads_up_mark()), `gate:<claim>` their episode -- go in the session
+ * file's `heads_up` map under its write lock, waited for
+ * HIVE_BROKER_GATE_WAIT at most, the file read again first: a hook of the
+ * same session that told it meanwhile wins, a flush holding an older copy
+ * keeps them (hive_session_merge_save()), and a mark that could not be
+ * saved says nothing, so nothing is said twice; the line is made before
+ * they are, so a claim marked told was told. The map keeps
+ * HIVE_HEADS_UP_MAX marks (hive_heads_up_bound()), a mark told here never
+ * dropped before the flush adopts it. The session's first heads-up line
+ * says why a heads-up is information (HIVE_HEADS_UP_WHY); later ones are
+ * short. Each line said is counted for the next heartbeat
+ * (hive_heads_up_count()), and a count that fails loses the number, never
+ * the line. No request and no git process: one read and
+ * two small writes, for the first line of a claim only.
+ *
+ * @param  array<string, mixed>  $session  as the gate loaded it
+ * @param  array<string, string>  $input  the hook's own input
+ * @param  array<string, mixed>  $cache
+ * @param  array{claim: array<string, mixed>, age: int, verdict: ?string, pairing: bool}  $found
+ */
+function hive_gate_heads_up(string $sessionId, array $session, array $input, array $cache, array $found, string $repo, string $relative, string $hash,
+    string $shown): ?string
+{
+    $claim = $found['claim'];
+    if ($found['verdict'] !== 'below' || ! empty($found['pairing']) || ! hive_claim_heads_up($claim, $hash)
+        || hive_same_file_mode($cache) !== 'heads_up' || hive_prompt_in_subagent($input) || hive_policy_silent($cache)) {
+        return null;
+    }
+
+    $id = hive_str($claim['id'] ?? null);
+    $who = hive_str($claim['developer'] ?? null);
+    if ($id === null || ! hive_is_ulid($id) || $who === null || trim($who) === '') {
+        return null;
+    }
+
+    $claimMark = hive_heads_up_claim_mark($repo, $id);
+    $fileMark = hive_heads_up_mark($repo, $relative, $who);
+    $heard = static function (array $session) use ($claimMark, $fileMark): bool {
+        $marks = is_array($session['heads_up'] ?? null) ? $session['heads_up'] : [];
+
+        return array_key_exists($claimMark, $marks) || array_key_exists($fileMark, $marks);
+    };
+    if ($heard($session)) {
+        return null;
+    }
+
+    $branch = hive_safe_branch_label($claim['branch'] ?? null, $claim['target_branch'] ?? null);
+    $paren = implode(', ', array_filter([$branch, $found['age'] !== PHP_INT_MAX ? 'active '.hive_ago($found['age']).' ago' : null],
+        static fn (?string $part): bool => $part !== null && $part !== ''));
+    $line = 'HIVE NOTE '.hive_dash().' for information: '.hive_claim_who($claim, 'a teammate').' is changing '
+        .hive_safe_text($shown, HIVE_SAFE_PATH_MAX * 2).' too'.($paren !== '' ? ' ('.$paren.')' : '').': a heads-up.';
+    $why = ' '.sprintf(HIVE_HEADS_UP_WHY, 'it');
+
+    $lock = hive_session_write_lock($sessionId, HIVE_BROKER_GATE_WAIT);
+    try {
+        $session = hive_session_load($sessionId);
+        if ($heard($session) || hive_session_roots($session) === []) {
+            return null;
+        }
+        $marks = is_array($session['heads_up'] ?? null) ? $session['heads_up'] : [];
+        $first = $marks === [];
+        $marks[$claimMark] = 'gate:'.$id;
+        $marks[$fileMark] = 'gate:'.$id;
+        $session['heads_up'] = hive_heads_up_bound($marks);
+        if (! hive_session_save($sessionId, $session)) {
+            return null;
+        }
+    } finally {
+        hive_session_write_unlock($lock);
+    }
+
+    try {
+        hive_heads_up_count(1);
+    } catch (Throwable $e) {
+        // The number is lost; the line is said all the same.
+    }
+
+    return $first ? $line.$why : $line;
+}
+
+/**
+ * Client 1.24.0: the session's heads-up marks held to HIVE_HEADS_UP_MAX,
+ * with nothing forgotten that a flush or the gate said.
+ *
+ * Over the cap, a teammate's file marks (hive_heads_up_mark(), `f:` and
+ * their key) are folded into that teammate's one wide mark
+ * (hive_heads_up_collapse(): `wide:` and the same key, the latest `since`
+ * said), the teammate with the most of them first, the oldest of equals:
+ * the files they stand for are still heard, where a mark dropped would let
+ * the next flush say its file again, at every flush after, for good. A mark
+ * the gate wrote and the flush has not adopted yet (`gate:<claim>`) is never
+ * folded or dropped here, nor a claim's (`claim:`) or a teammate's (`wide:`):
+ * each of those stands for many files or for a line already said. Only when
+ * nothing more can be folded are the oldest of the other marks dropped, and
+ * last of all the oldest of any, so the map stays bounded whatever it
+ * holds.
+ *
+ * @param  array<string, mixed>  $marks  oldest first
+ * @return array<string, mixed>
+ */
+function hive_heads_up_bound(array $marks): array
+{
+    if (count($marks) <= HIVE_HEADS_UP_MAX) {
+        return $marks;
+    }
+
+    $told = static fn ($episode): bool => is_string($episode) && str_starts_with($episode, 'gate:');
+
+    // The teammates with file marks to fold, the most marks first.
+    $files = [];
+    foreach ($marks as $mark => $episode) {
+        if (! $told($episode) && preg_match('/^f:([0-9a-f]{32}):/', (string) $mark, $teammate) === 1) {
+            $files[$teammate[1]] = ($files[$teammate[1]] ?? 0) + 1;
+        }
+    }
+    arsort($files);
+    foreach ($files as $teammate => $count) {
+        if (count($marks) <= HIVE_HEADS_UP_MAX) {
+            break;
+        }
+        if ($count > 1 || array_key_exists('wide:'.$teammate, $marks)) {
+            $marks = hive_heads_up_collapse($marks, (string) $teammate);
+        }
+    }
+
+    $over = count($marks) - HIVE_HEADS_UP_MAX;
+    foreach ($marks as $mark => $episode) {
+        if ($over <= 0) {
+            break;
+        }
+        if (! $told($episode) && ! str_starts_with((string) $mark, 'claim:') && ! str_starts_with((string) $mark, 'wide:')) {
+            unset($marks[$mark]);
+            $over--;
+        }
+    }
+
+    return $over > 0 ? array_slice($marks, $over, null, true) : $marks;
+}
+
+/**
+ * Client 1.24.0: the key a teammate's heads-up marks in a repository share:
+ * the md5 of `slug|who` folded. Their file marks are `f:` and it
+ * (hive_heads_up_mark()), their wide mark `wide:` and it
+ * (hive_heads_up_wide_mark()), so the map can fold the first into the
+ * second knowing nothing else.
+ */
+function hive_heads_up_teammate(string $slug, string $who): string
+{
+    return md5(hive_fold($slug.'|'.$who));
+}
+
+/**
+ * Client 1.24.0: the key a heads-up about a file is kept under in the
+ * session's `heads_up` map: `f:`, the teammate's key
+ * (hive_heads_up_teammate(): the repository's slug as this client knows it
+ * and their login), `:` and the md5 of the file's repository-relative path
+ * with forward slashes, folded -- so the gate and the flush mark one file
+ * and teammate alike, whatever case or slashes the path came in. Never a
+ * path in the file.
+ */
+function hive_heads_up_mark(string $slug, string $scope, string $who): string
+{
+    return 'f:'.hive_heads_up_teammate($slug, $who).':'.md5(hive_fold($scope));
+}
+
+/**
+ * Client 1.24.0: the key a teammate's claim told at the gate is kept under
+ * in the session's `heads_up` map: `claim:` and the md5 of `slug|ulid`
+ * folded.
+ */
+function hive_heads_up_claim_mark(string $slug, string $claimId): string
+{
+    return 'claim:'.md5(hive_fold($slug.'|'.$claimId));
+}
+
+/**
+ * Client 1.24.0: the key a teammate's files in a repository are kept under
+ * as a whole, once a flush said more than HIVE_HEADS_UP_WIDE of them, or
+ * the map was full: `wide:` and the teammate's key
+ * (hive_heads_up_teammate()), its episode the latest `since` said.
+ */
+function hive_heads_up_wide_mark(string $slug, string $who): string
+{
+    return 'wide:'.hive_heads_up_teammate($slug, $who);
+}
+
+/**
+ * Client 1.24.0: a teammate's file marks in $marks (`f:<teammate>:<file>`)
+ * folded into their wide mark (`wide:<teammate>`), which takes the latest
+ * `since` of the wide mark held, the file marks folded and $since, and goes
+ * last in the map. A file mark the gate wrote and the flush has not
+ * adopted (`gate:<claim>`) stays as it is. $teammate is the key of
+ * hive_heads_up_teammate().
+ *
+ * @param  array<string, mixed>  $marks
+ * @return array<string, mixed>
+ */
+function hive_heads_up_collapse(array $marks, string $teammate, ?string $since = null): array
+{
+    $wide = 'wide:'.$teammate;
+    $prefix = 'f:'.$teammate.':';
+    $latest = is_string($marks[$wide] ?? null) && $marks[$wide] !== '' && ! str_starts_with($marks[$wide], 'gate:') ? $marks[$wide] : null;
+    if ($since !== null && $since !== '' && hive_since_later($since, $latest)) {
+        $latest = $since;
+    }
+
+    foreach ($marks as $mark => $episode) {
+        if (! str_starts_with((string) $mark, $prefix) || (is_string($episode) && str_starts_with($episode, 'gate:'))) {
+            continue;
+        }
+        unset($marks[$mark]);
+        if (is_string($episode) && $episode !== '' && hive_since_later($episode, $latest)) {
+            $latest = $episode;
+        }
+    }
+
+    unset($marks[$wide]);
+    $marks[$wide] = $latest ?? '';
+
+    return $marks;
 }
 
 /**
@@ -16065,6 +16531,260 @@ function hive_noted_once(string $sessionId, array $lines): array
 }
 
 /**
+ * Client 1.24.0: the one line a flush says of the heads-ups it found
+ * (hive_heads_up_found()) that this session has not heard: information,
+ * never an order -- a teammate is changing a file this session changes too,
+ * or the other way round, and Hive holds it for neither. Grouped by
+ * teammate and repository, at most three groups and two files a group
+ * named ("and 38 more"), so a wide claim is one line; a fourth teammate is
+ * said at a later flush. The session's first heads-up line says why a
+ * heads-up is information (HIVE_HEADS_UP_WHY); later ones do not.
+ *
+ * The marks are read again from the session file under its write lock, as
+ * hive_noted_once() reads them: a file the gate told of at the edit
+ * (`gate:<claim>` for one of its claims) takes the picture's `since` and is
+ * not said again, one heard for this `since` or a later one is passed over,
+ * and each one said is marked with its `since` -- past HIVE_HEADS_UP_WIDE
+ * files of one teammate, counting the marks the session holds of them as
+ * well as this note's, their files there as a whole, one mark with the
+ * latest `since` (hive_heads_up_wide_mark()) their file marks are folded
+ * into, so a pair sharing hundreds of files, or a claim that grows a few
+ * files at every publish, fills no map and hears no file twice. The map
+ * keeps HIVE_HEADS_UP_MAX marks, folding rather than dropping what is over
+ * it (hive_heads_up_bound()). The line is made before
+ * the marks are written and said only once they are. With $speak false --
+ * something else spoke this batch, or the flush is a sub-agent's -- nothing
+ * is said or marked said, and the gate's marks are still adopted. Null while
+ * the owner has collision warnings off (hive_policy_silent()) or with
+ * nothing new. Each line said is counted for the next heartbeat
+ * (hive_heads_up_count()), and a count that fails loses the number only.
+ *
+ * At a flush that may speak, each fresh picture of the session is read for
+ * heads-ups first (hive_heads_up_found()), so one a sub-agent's flush, a
+ * Stop or the detached publish merged is said here; a note found in an
+ * answer this flush has had a later one of since, which no longer says
+ * heads-up, is dropped. The line holds as many groups as fit
+ * HIVE_SAFE_MESSAGE_MAX whole (hive_heads_up_words()); the rest wait,
+ * unmarked. A teammate's files said as a whole mark each claim they are in
+ * as well, so the gate tells none of those claims again.
+ *
+ * And the switch (the coordinator's addition): the <hive-client> note says
+ * how the owners' same-file switch stands at a session start only, and an
+ * owner may flip it, or put a repository on the hold list, mid-session. So
+ * the switch's line is made again from the session's pictures
+ * (hive_same_file_line()) and said once, as a fact, at the end of the same
+ * note, when it is not what the session was last told (`same_file_said`,
+ * the md5 of the line, which session start records too); never again for
+ * an unchanged state, never into a sub-agent, nothing while silent. Not a
+ * heads-up line: not counted.
+ *
+ * @param  array<string, mixed>  $session
+ */
+function hive_heads_up_note(string $sessionId, array $session, bool $speak = true): ?string
+{
+    $ledger = hive_wake_ledger();
+    if ($ledger === null || (! $speak && $ledger['heads_up_notes'] === [])) {
+        return null;
+    }
+
+    // The session's pictures, once a repository; nothing while the owner
+    // has collision warnings off. At a flush that may speak, each fresh one
+    // is read for heads-ups too, whoever's flush merged it.
+    $caches = [];
+    foreach (hive_session_roots($session) as $root => $slug) {
+        $key = hive_fold((string) $slug);
+        if (! array_key_exists($key, $caches)) {
+            $caches[$key] = hive_cache_load((string) $slug);
+            if (hive_policy_silent($caches[$key])) {
+                return null;
+            }
+        }
+        if ($speak && is_array($caches[$key]) && hive_cache_tier($caches[$key]) === 'fresh') {
+            try {
+                hive_heads_up_found($caches[$key], hive_repo_label($session, (string) $root, (string) $slug), (string) $slug, false);
+            } catch (Throwable $e) {
+                // Found at a later flush.
+            }
+        }
+    }
+    $queued = hive_wake_ledger()['heads_up_notes'] ?? [];
+
+    // The switch's line, as the session note says it (hive_same_file_line()):
+    // said once more when it is not what the session was last told
+    // (`same_file_said`). An error says nothing.
+    $switch = null;
+    $policy = hive_same_file_policy(array_values($caches));
+    if ($speak) {
+        try {
+            $switch = hive_same_file_line(array_values($caches));
+        } catch (Throwable $e) {
+            $switch = null;
+        }
+    }
+    if ($queued === [] && ($switch === null || md5($switch) === ($session['same_file_said'] ?? null))) {
+        return null;
+    }
+
+    $line = null;
+    $said = [];
+    $lock = hive_session_write_lock($sessionId);
+    try {
+        $fresh = hive_session_load($sessionId);
+        if (hive_session_roots($fresh) === []) {
+            return null;
+        }
+        $marks = is_array($fresh['heads_up'] ?? null) ? $fresh['heads_up'] : [];
+        $first = $marks === [];
+        $changed = false;
+        $groups = [];
+        foreach ($queued as $mark => $note) {
+            $mark = (string) $mark;
+            // Found in an answer this flush has had a later one of since,
+            // its own repository's or another's: the newest policy the
+            // session's pictures hold is what goes, the one the switch's line
+            // is made from.
+            if ($policy === null || hive_same_file_mode(['repo' => $note['slug'], 'policy' => $policy]) !== 'heads_up') {
+                continue;
+            }
+            $since = $note['since'] !== '' ? $note['since'] : null;
+            $wide = hive_heads_up_wide_mark($note['slug'], $note['who']);
+            $heard = hive_heads_up_heard($marks[$mark] ?? null, $since, $note['ids'], $marks[$wide] ?? null);
+            if ($heard === 'adopt') {
+                $marks[$mark] = $note['since'];
+                $changed = true;
+
+                continue;
+            }
+            if ($heard === 'heard' || ! $speak) {
+                continue;
+            }
+
+            $group = $note['slug']."\0".hive_fold($note['who']);
+            if (! isset($groups[$group]) && count($groups) >= 3) {
+                continue;
+            }
+            $groups[$group] = $groups[$group] ?? ['slug' => $note['slug'], 'who' => $note['who'], 'branch' => $note['branch'], 'wide' => $wide,
+                'teammate' => hive_heads_up_teammate($note['slug'], $note['who']), 'files' => [], 'marks' => [], 'ids' => [], 'since' => null];
+            $groups[$group]['files'][] = $note['file'];
+            $groups[$group]['marks'][$mark] = $note['since'];
+            $groups[$group]['ids'] = array_values(array_unique(array_merge($groups[$group]['ids'], $note['ids'])));
+            if ($since !== null && hive_since_later($since, $groups[$group]['since'])) {
+                $groups[$group]['since'] = $since;
+            }
+        }
+        $switch = $switch !== null && md5($switch) !== ($fresh['same_file_said'] ?? null) ? $switch : null;
+
+        // As many groups as the note's room holds, first found first: the
+        // rest wait, unmarked, for a later note, so no sentence is cut off.
+        // The switch's line goes last; where not even one group fits beside
+        // it, it waits, unrecorded, for a later note of its own.
+        $groups = array_values($groups);
+        $fits = static fn (array $some, ?string $line): bool => hive_progress_chars('HIVE NOTE '.hive_dash().' for information: '
+            .hive_heads_up_words($some, $first, $line)) <= HIVE_SAFE_MESSAGE_MAX;
+        $take = count($groups);
+        while ($take > 1 && ! $fits(array_slice($groups, 0, $take), $switch)) {
+            $take--;
+        }
+        if ($take > 0 && $switch !== null && ! $fits(array_slice($groups, 0, $take), $switch)) {
+            $switch = null;
+            $take = count($groups);
+            while ($take > 1 && ! $fits(array_slice($groups, 0, $take), null)) {
+                $take--;
+            }
+        }
+        $said = array_slice($groups, 0, $take);
+        $words = $said !== [] || $switch !== null ? hive_heads_up_words($said, $first, $switch) : null;
+
+        // Marked said: a file at a time, or past HIVE_HEADS_UP_WIDE files of
+        // a teammate's in all -- the marks the session holds of them and the
+        // files of this note, however many notes it took -- their files
+        // there as a whole, with the latest `since` said (their file marks
+        // folded into it), and each claim of theirs those files are in, so
+        // the gate tells none of them again either.
+        foreach ($said as $group) {
+            $prefix = 'f:'.$group['teammate'].':';
+            $known = array_fill_keys(array_keys($group['marks']), true);
+            foreach ($marks as $mark => $episode) {
+                if (str_starts_with((string) $mark, $prefix)) {
+                    $known[(string) $mark] = true;
+                }
+            }
+            if (count($known) > HIVE_HEADS_UP_WIDE) {
+                $marks = hive_heads_up_collapse($marks, $group['teammate'], $group['since']);
+                foreach ($group['ids'] as $id) {
+                    if (hive_is_ulid($id)) {
+                        $claim = hive_heads_up_claim_mark($group['slug'], $id);
+                        $marks[$claim] = $marks[$claim] ?? ($group['since'] ?? '');
+                    }
+                }
+            } else {
+                foreach ($group['marks'] as $done => $since) {
+                    unset($marks[$done]);
+                    $marks[$done] = $since;
+                }
+            }
+            $changed = true;
+        }
+        if ($switch !== null) {
+            $fresh['same_file_said'] = md5($switch);
+            $changed = true;
+        }
+        if (! $changed) {
+            return null;
+        }
+        if ($words !== null && ($said !== [] || $switch !== null)) {
+            $line = hive_safe_text('HIVE NOTE '.hive_dash().' for information: '.$words, HIVE_SAFE_MESSAGE_MAX, false);
+        }
+
+        $fresh['heads_up'] = hive_heads_up_bound($marks);
+        if (! hive_session_save($sessionId, $fresh)) {
+            return null;
+        }
+    } finally {
+        hive_session_write_unlock($lock);
+    }
+
+    if ($line !== null && $said !== []) {
+        try {
+            hive_heads_up_count(1);
+        } catch (Throwable $e) {
+            // The number is lost; the line is said all the same.
+        }
+    }
+
+    return $line;
+}
+
+/**
+ * Client 1.24.0: the words of hive_heads_up_note()'s line after "for
+ * information: ": each group a teammate changing their files too in one
+ * repository, two named and how many more; "a heads-up" for one file,
+ * "heads-ups" for more; the session's first with why a heads-up is
+ * information (HIVE_HEADS_UP_WHY); and the switch's line, when it changed,
+ * last. Teammates' words made safe here.
+ *
+ * @param  list<array{who: string, branch: ?string, files: list<string>}>  $groups
+ */
+function hive_heads_up_words(array $groups, bool $first, ?string $switch): string
+{
+    $parts = [];
+    $files = 0;
+    foreach ($groups as $group) {
+        $named = array_map(static fn (string $file): string => hive_safe_text($file, HIVE_SAFE_PATH_MAX * 2), array_slice($group['files'], 0, 2));
+        $more = count($group['files']) - count($named);
+        $files += count($group['files']);
+        $who = hive_safe_text($group['who'], HIVE_SAFE_NAME_MAX);
+        $parts[] = ($who !== '' ? $who : 'a teammate').' is changing '.($more > 0 ? implode(', ', $named).' and '.$more.' more' : implode(' and ', $named))
+            .' too'.(is_string($group['branch']) && $group['branch'] !== '' ? ' ('.$group['branch'].')' : '');
+    }
+
+    $words = $parts === [] ? '' : implode('; ', $parts).': '.($files === 1 ? 'a heads-up.' : 'heads-ups.')
+        .($first ? ' '.sprintf(HIVE_HEADS_UP_WHY, $files === 1 ? 'it' : 'those files') : '');
+
+    return trim($words.($switch !== null ? ' '.$switch : ''));
+}
+
+/**
  * What every flush does last, whatever else it did: on PostToolBatch the
  * parked tasks' part (hive_waits_flush()), then the work plan's
  * (hive_plan_hook()), then the progress report's (hive_progress_hook()).
@@ -16187,6 +16907,20 @@ function hive_flush_tail(string $event, ?string $base, string $sessionId, array 
         }
         if ($ruled !== null) {
             hive_emit(['hookSpecificOutput' => ['hookEventName' => 'PostToolBatch', 'additionalContext' => $ruled]]);
+            $speak = false;
+        }
+        // Client 1.24.0: a teammate changing a file this session changes
+        // too, or the other way round, where Hive calls it a heads-up: once,
+        // as information, when nothing else spoke; the gate's word on one is
+        // adopted whatever spoke. Never exit 2. An error says nothing: it is
+        // found and said at a later flush.
+        try {
+            $headsUp = hive_heads_up_note($sessionId, $session, $speak);
+        } catch (Throwable $e) {
+            $headsUp = null;
+        }
+        if ($headsUp !== null) {
+            hive_emit(['hookSpecificOutput' => ['hookEventName' => 'PostToolBatch', 'additionalContext' => $headsUp]]);
             $speak = false;
         }
         // A slice's one-time note that reached this session's pictures
@@ -20084,8 +20818,13 @@ function hive_merge_snapshot(string $repo, array $json, ?array $previous, bool $
         $cache['conflicts'] = array_values($conflicts);
     }
 
+    // Client 1.24.0: when this policy came (`policy_at`), apart from the
+    // picture's `fetched_at`, which a `check` moves with no policy: the
+    // newest word on the owners' same-file switch is the newest policy, not
+    // the newest picture (hive_same_file_policy()).
     if ($policy !== null) {
         $cache['policy'] = $policy;
+        $cache['policy_at'] = time();
     }
 
     // A PUT /claims without a picture still carries the ruling on the claim
@@ -20106,6 +20845,16 @@ function hive_merge_snapshot(string $repo, array $json, ?array $previous, bool $
     $new = hive_unannounced_hard($cache, $label, $announce, $atStart, $repo);
     if ($new !== [] && $announce && ! $atStart) {
         hive_hard_repos($repo);
+    }
+
+    // Client 1.24.0: a teammate changing a file this session changes too,
+    // or its change to a teammate's file, where Hive calls that a heads-up,
+    // found for the flush to say once as information (hive_heads_up_found()).
+    // An error finds nothing: the next picture finds it.
+    try {
+        hive_heads_up_found(['repo' => $repo] + $cache, $label, $repo, $atStart);
+    } catch (Throwable $e) {
+        // Found at the next picture.
     }
 
     hive_cache_save($repo, $cache);
@@ -20272,6 +21021,116 @@ function hive_unannounced_hard(array &$cache, string $label, bool $stamp, bool $
 }
 
 /**
+ * Client 1.24.0: the heads-ups a picture holds, for the flush to tell this
+ * session once, as information (hive_heads_up_note()): each conflict Hive
+ * scored soft because two people change one file (`concurrent_edit`), on a
+ * scope that names one file (hive_scope_names_file()), on either side of
+ * it -- a teammate began changing a file this session changes, or this
+ * session began changing a teammate's -- one per file and teammate, as
+ * hive_unannounced_hard() takes them (the latest `since` of the teammate's
+ * claims there, every claim's id). Queued in the flush's ledger
+ * (`heads_up_notes`, hive_wake_ledger()), never said here.
+ *
+ * Called by hive_merge_snapshot() for each answer a flush merges, and by
+ * hive_heads_up_note() for each fresh picture of the session at a flush of
+ * the main agent's, so a heads-up a sub-agent's flush, a Stop or the
+ * detached publish brought is said at the main agent's next flush, as
+ * hive_deferred_hard() brings a wake-up. Only inside a flush (the ledger
+ * loaded), never at a session start, whose <hive> block says what it says,
+ * and only where the policy says
+ * same-file edits are a heads-up in this repository (hive_same_file_mode()):
+ * a picture scored before the owners flipped to hold says nothing new. A
+ * file the session heard of already for this `since` or a later one is
+ * passed over (hive_heads_up_heard()); one the gate told of at the edit is
+ * queued too, for hive_heads_up_note() to adopt. A conflict with the
+ * developer's own other work is no teammate's.
+ *
+ * @param  array<string, mixed>  $cache
+ */
+function hive_heads_up_found(array $cache, string $label, string $slug, bool $atStart): void
+{
+    $ledger = hive_wake_ledger();
+    if ($atStart || $ledger === null || hive_same_file_mode($cache) !== 'heads_up') {
+        return;
+    }
+
+    $me = is_array($cache['you'] ?? null) ? hive_str($cache['you']['dev'] ?? null) : null;
+    $groups = [];
+    foreach ((array) ($cache['conflicts'] ?? []) as $conflict) {
+        if (! is_array($conflict) || ($conflict['severity'] ?? null) !== 'soft' || ($conflict['dampened_by'] ?? null) !== 'concurrent_edit'
+            || ($conflict['reason'] ?? null) === 'self_overlap' || ! hive_scope_names_file($conflict)) {
+            continue;
+        }
+
+        $who = hive_conflict_who($conflict);
+        if ($me !== null && hive_fold($who) === hive_fold($me)) {
+            continue;
+        }
+        $scope = (string) hive_str($conflict['scope'] ?? null);
+        $mark = hive_heads_up_mark($slug, $scope, $who);
+        $since = hive_str($conflict['since'] ?? null);
+        $id = hive_str($conflict['id'] ?? null);
+
+        if (! isset($groups[$mark])) {
+            $groups[$mark] = ['conflict' => $conflict, 'since' => $since, 'ids' => []];
+        } elseif (hive_since_later($since, $groups[$mark]['since'])) {
+            $groups[$mark]['conflict'] = $conflict;
+            $groups[$mark]['since'] = $since;
+        }
+        if ($id !== null) {
+            $groups[$mark]['ids'][] = $id;
+        }
+    }
+
+    $queue = [];
+    foreach ($groups as $mark => $group) {
+        $conflict = $group['conflict'];
+        $wide = $ledger['heads_up'][hive_heads_up_wide_mark($slug, hive_conflict_who($conflict))] ?? null;
+        if (hive_heads_up_heard($ledger['heads_up'][$mark] ?? null, $group['since'], $group['ids'], $wide) === 'heard') {
+            continue;
+        }
+        $queue[$mark] = [
+            'slug' => $slug,
+            'who' => hive_conflict_who($conflict),
+            'file' => $label.(string) hive_str($conflict['scope'] ?? null),
+            'branch' => hive_safe_branch_label($conflict['branch'] ?? null, $conflict['target_branch'] ?? null),
+            'since' => $group['since'] ?? '',
+            'ids' => $group['ids'],
+        ];
+    }
+    if ($queue !== []) {
+        hive_wake_ledger(null, null, null, $queue);
+    }
+}
+
+/**
+ * Client 1.24.0: what the session's mark of a heads-up ($recorded, its
+ * `heads_up` map's value for the file) says of the one a picture holds now:
+ * `heard` when it was said for this `since` or a later one
+ * (hive_same_episode()); `adopt` when the gate told of it at the edit,
+ * `gate:<claim>` for one of the claims the conflict names ($ids), which the
+ * mark then takes the `since` of, saying nothing; else `heard` when the
+ * teammate's files there were said as a whole ($wide, their wide mark's
+ * value) for this `since` or a later one; null when it is new to this
+ * session.
+ *
+ * @param  mixed  $recorded
+ * @param  list<string>  $ids
+ * @param  mixed  $wide
+ */
+function hive_heads_up_heard($recorded, ?string $since, array $ids, $wide = null): ?string
+{
+    if (is_string($recorded) && str_starts_with($recorded, 'gate:') && in_array(substr($recorded, 5), $ids, true)) {
+        return 'adopt';
+    }
+    if ($recorded !== null && ! (is_string($recorded) && str_starts_with($recorded, 'gate:')) && hive_same_episode($recorded, $since)) {
+        return 'heard';
+    }
+
+    return $wide !== null && ! (is_string($wide) && str_starts_with($wide, 'gate:')) && hive_same_episode($wide, $since) ? 'heard' : null;
+}
+
+/**
  * What a flush knows of what its session was woken about (client 1.13.1):
  * the session file's `woken` map, file and teammate per repository => the
  * `since` it was woken for ('' when the server sent none). The repository's
@@ -20283,19 +21142,23 @@ function hive_unannounced_hard(array &$cache, string $label, bool $stamp, bool $
  * session's edit tools changed (`touched`, hive_touched()), the overlaps it
  * was told of as information only (`noted`, the session file's map of the
  * same marks), and the lines of those still to say (`notes`,
- * hive_quiet_hard_note()).
+ * hive_quiet_hard_note()). Client 1.24.0: the session's heads-up marks
+ * (`heads_up`, hive_gate_heads_up()), and the heads-ups a picture of this
+ * flush holds that the session may not have heard (`heads_up_notes`,
+ * hive_heads_up_found(), said by hive_heads_up_note()).
  *
  * $load starts a flush's ledger from its session, keeping the notes found
  * so far; $add records what this flush is about to wake the agent with,
  * kept in `added` for hive_wake_ledger_commit(); $note adds a line to say
- * as information.
+ * as information; $headsUp, heads-ups found, by mark, the latest kept.
  *
  * @param  array<string, mixed>|null  $load
  * @param  array<string, string>|null  $add
  * @param  array<string, string>|null  $note
- * @return array{woken: array<string, mixed>, added: array<string, string>, touched: array<string, array<string, mixed>>, noted: array<string, mixed>, notes: array<string, string>}|null
+ * @param  array<string, array<string, mixed>>|null  $headsUp
+ * @return array{woken: array<string, mixed>, added: array<string, string>, touched: array<string, array<string, mixed>>, noted: array<string, mixed>, notes: array<string, string>, heads_up: array<string, mixed>, heads_up_notes: array<string, array<string, mixed>>}|null
  */
-function hive_wake_ledger(?array $load = null, ?array $add = null, ?array $note = null): ?array
+function hive_wake_ledger(?array $load = null, ?array $add = null, ?array $note = null, ?array $headsUp = null): ?array
 {
     static $ledger = null;
 
@@ -20306,10 +21169,15 @@ function hive_wake_ledger(?array $load = null, ?array $add = null, ?array $note 
             'touched' => hive_touched($load),
             'noted' => is_array($load['noted'] ?? null) ? $load['noted'] : [],
             'notes' => $ledger['notes'] ?? [],
+            'heads_up' => is_array($load['heads_up'] ?? null) ? $load['heads_up'] : [],
+            'heads_up_notes' => $ledger['heads_up_notes'] ?? [],
         ];
     }
     if ($note !== null && $ledger !== null) {
         $ledger['notes'] = $ledger['notes'] + $note;
+    }
+    if ($headsUp !== null && $ledger !== null) {
+        $ledger['heads_up_notes'] = array_replace($ledger['heads_up_notes'], $headsUp);
     }
     if ($add !== null && $ledger !== null) {
         foreach ($add as $mark => $since) {
@@ -20449,6 +21317,9 @@ function hive_deferred_hard(array $session, array $roots, bool $stamp): array
 /**
  * One conflict, whatever shape it arrived in, as the flat shape the cache
  * keeps: {id, severity, scope, developer, branch, target_branch, reason}.
+ * Client 1.24.0: and `dampened_by`, why Hive scored it below what it would
+ * otherwise be, when it is a word this client knows (HIVE_CHECK_DAMPENINGS):
+ * `concurrent_edit` is how the flush tells a heads-up (hive_heads_up_found()).
  *
  * @param  array<string, mixed>  $conflict
  * @return array<string, string>
@@ -20465,6 +21336,7 @@ function hive_normalise_conflict(array $conflict): array
         'branch' => hive_str($conflict['branch'] ?? null) ?? hive_str($with['branch'] ?? null),
         'target_branch' => hive_str($conflict['target_branch'] ?? null) ?? hive_str($with['target_branch'] ?? null),
         'reason' => hive_str($conflict['reason'] ?? null),
+        'dampened_by' => hive_enum($conflict['dampened_by'] ?? null, HIVE_CHECK_DAMPENINGS, '') ?: null,
         // When the teammate's current work there began: what an announcement
         // is kept against (hive_unannounced_hard).
         'since' => hive_str($conflict['since'] ?? null),
@@ -24875,6 +25747,20 @@ function hive_render_client_hint(array $caches, ?string $base = null): ?string
     // task can start, so the line from lanes.json, which would say the same
     // lane a second time, is left out.
     $slices = hive_slice_client_lines($caches, $cmd);
+    // Client 1.24.0: how the owners' same-file switch stands here, which the
+    // 1.24.0 rules text points at, after the broker's lines. None from a
+    // policy without it. What the session is told is kept, so a flush says
+    // it again only once it changes (hive_heads_up_note()).
+    try {
+        $sameFile = hive_same_file_line($caches);
+    } catch (Throwable $e) {
+        $sameFile = null;
+    }
+    try {
+        hive_same_file_said($sessionId, $sameFile);
+    } catch (Throwable $e) {
+        // A flush says it once more.
+    }
     $broker = array_values(array_filter($broker, static function (string $line) use ($slices): bool {
         if (! str_starts_with($line, 'Your lane: ')) {
             return true;
@@ -24888,7 +25774,147 @@ function hive_render_client_hint(array $caches, ?string $base = null): ?string
         return true;
     }));
 
-    return implode("\n", hive_client_hint_lines($cmd, $check, array_merge($broker, $extra, $slices), hive_next_offered()));
+    return implode("\n", hive_client_hint_lines($cmd, $check, array_merge($broker, $sameFile !== null ? [$sameFile] : [], $extra, $slices),
+        hive_next_offered()));
+}
+
+/**
+ * Client 1.24.0: the <hive-client> note's line on the owners' same-file
+ * switch, for every repository of $caches -- whatever its picture's age --
+ * from the newest policy a live picture holds that knows the switch
+ * (hive_same_file_policy(), by when the policy came; the policy is the
+ * team's, one for every repository): a heads-up everywhere -- Hive holds a file two people change
+ * for neither, so editing a file first holds nothing -- held everywhere, or
+ * a heads-up but in the repositories held, named by the last part of their
+ * slug, sorted. The 1.24.0 rules text says editing first holds nothing only
+ * where this line says same-file edits are a heads-up, so the rules stay
+ * true whichever way an owner sets the switch; a flush says the line again
+ * once it changes (hive_heads_up_note()), and the set of repositories it is
+ * made for does not change with a picture's age. Null when no live picture
+ * knows the switch: a Hive before 2.15.0 says nothing new.
+ *
+ * @param  array<mixed>  $caches  one per repository, null for none
+ */
+function hive_same_file_line(array $caches): ?string
+{
+    $policy = hive_same_file_policy($caches);
+    if ($policy === null) {
+        return null;
+    }
+    $repos = [];
+    foreach ($caches as $cache) {
+        $repo = is_array($cache) ? hive_str($cache['repo'] ?? null) : null;
+        if ($repo !== null && $repo !== '') {
+            $repos[strtolower(hive_broker_repo_name($repo))] = $repo;
+        }
+    }
+
+    $heads = [];
+    $held = [];
+    foreach ($repos as $name => $repo) {
+        $mode = hive_same_file_mode(['repo' => $repo, 'policy' => $policy]);
+        $name = hive_safe_text((string) $name, HIVE_SAFE_NAME_MAX);
+        if ($mode === 'hold') {
+            $held[$name] = true;
+        } elseif ($mode === 'heads_up') {
+            $heads[$name] = true;
+        }
+    }
+
+    if ($heads === [] && $held === []) {
+        return null;
+    }
+    if ($held === []) {
+        return 'Same-file edits are a heads-up here: Hive holds a file two people change for neither of them, so editing a file first holds nothing.';
+    }
+    if ($heads === []) {
+        return 'Same-file edits are held here: Hive holds a file two people change for whoever began first.';
+    }
+
+    $names = array_map('strval', array_keys($held));
+    sort($names);
+    $last = (string) array_pop($names);
+
+    return 'Same-file edits are a heads-up here, so editing a file first holds nothing, except in '.($names !== [] ? implode(', ', $names).' and ' : '')
+        .$last.', where Hive holds a file two people change for whoever began first.';
+}
+
+/**
+ * Client 1.24.0: the team's policy that knows the owners' same-file switch
+ * and came last (`policy_at`, when a heartbeat or GET /policy brought it,
+ * hive_merge_snapshot()) among the live pictures of $caches (fresh or
+ * warm), or null: what hive_same_file_line() and hive_heads_up_note() read
+ * the switch by, so a note never says a file is a heads-up beside a line
+ * that says it is held. Not the newest picture's: a `check` merges its
+ * picture with no policy and moves `fetched_at`, so ranking by it made a
+ * repository's older policy the newest one after the owners' flip, and the
+ * note flapped between the two. A picture with no `policy_at` (a cache
+ * written before 1.24.0) counts as 0, and pictures that tie on it go by
+ * the newer `fetched_at`.
+ *
+ * @param  array<mixed>  $caches
+ * @return array<string, mixed>|null
+ */
+function hive_same_file_policy(array $caches): ?array
+{
+    $policy = null;
+    $newest = [PHP_INT_MIN, PHP_INT_MIN];
+    foreach ($caches as $cache) {
+        if (! is_array($cache)) {
+            continue;
+        }
+        $rank = [(int) ($cache['policy_at'] ?? 0), (int) ($cache['fetched_at'] ?? 0)];
+        if ($rank > $newest && in_array(hive_cache_tier($cache), ['fresh', 'warm'], true) && hive_same_file_mode($cache) !== null) {
+            $policy = is_array($cache['policy'] ?? null) ? $cache['policy'] : null;
+            $newest = $rank;
+        }
+    }
+
+    return $policy;
+}
+
+/**
+ * Client 1.24.0: keeps in the session file what the session was told of
+ * the owners' same-file switch (`same_file_said`: the md5 of the line, none
+ * for none), under the session's write lock, so a flush says the line again
+ * only once it changes (hive_heads_up_note()). Session start's.
+ */
+function hive_same_file_said(string $sessionId, ?string $line): void
+{
+    $lock = hive_session_write_lock($sessionId);
+    try {
+        $session = hive_session_load($sessionId);
+        $said = $line === null ? null : md5($line);
+        if (hive_session_roots($session) === [] || ($session['same_file_said'] ?? null) === $said) {
+            return;
+        }
+        if ($said === null) {
+            unset($session['same_file_said']);
+        } else {
+            $session['same_file_said'] = $said;
+        }
+        hive_session_save($sessionId, $session);
+    } finally {
+        hive_session_write_unlock($lock);
+    }
+}
+
+/**
+ * Client 1.24.0: a session start that emits but gives the agent no switch
+ * line -- no token, no live picture, a pause, no picture at all, or
+ * nothing to show -- forgets what the session was told of the switch
+ * (`same_file_said`), which an earlier start, kept by a compaction or a
+ * clear, may have recorded: the conversation holds none of it now, and the
+ * next flush that knows the switch says it. An error leaves the record, and
+ * a flush may then keep a line back that the agent never saw.
+ */
+function hive_same_file_unsaid(string $sessionId): void
+{
+    try {
+        hive_same_file_said($sessionId, null);
+    } catch (Throwable $e) {
+        // The record stays.
+    }
 }
 
 /**
@@ -26466,7 +27492,17 @@ function hive_check_raised(array $announced, array $episodes, string $scope, str
         && (hive_same_episode($episodes[$key] ?? null, $since) || hive_asked_episode($episodes[$key] ?? null, $at, $claimId, $now));
 }
 
-/** Why a NOTE is only a note: the first rule of A.6's table that matches. */
+/**
+ * Why a NOTE is only a note: the first rule of A.6's table that matches.
+ *
+ * Client 1.24.0: a file Hive scored `concurrent_edit` -- two people
+ * changing one file, where the owners' same-file switch makes that a
+ * heads-up for this repository -- is said as one: git merges most such
+ * changes, and "expect a merge conflict", what 1.22.0 and 1.23.0 say of
+ * it, overstated it. The check's answer is scored as the switch stands
+ * when it is asked, so its word needs no policy beside it. A structural
+ * file and a move keep their own words, which say more.
+ */
 function hive_check_why(string $severity, string $reason, string $dampened): string
 {
     if ($dampened === 'collaborating_same_branch') {
@@ -26486,6 +27522,9 @@ function hive_check_why(string $severity, string $reason, string $dampened): str
     }
     if ($reason === 'rename_vs_write') {
         return 'git carries an edit across the move: only lines the move changed can conflict';
+    }
+    if ($dampened === 'concurrent_edit') {
+        return 'a heads-up: you are both changing it, and git merges most of these';
     }
 
     return $severity === 'soft' ? 'expect a merge conflict' : 'heads-up only';
@@ -36089,10 +37128,14 @@ function hive_waits_lock(float $wait)
  *
  *   waits   wait ulid => {repo, key, title, path, label, hash, claim, dev,
  *           login, branch, since, session, state, reason, freed_at,
- *           quiet_at, parked_at, kind, slice, own}: `path` the file in its
- *           repository and `label` as the agent named it, both kept here
- *           only; a slice wait (kind `slice`, SECTION 18g) has no path, and
- *           names the slice it waits on and the task's own slice
+ *           quiet_at, parked_at, kind, slice, own, overridden, heads_up}:
+ *           `path` the file in its repository and `label` as the agent
+ *           named it, both kept here only; a slice wait (kind `slice`,
+ *           SECTION 18g) has no path, and names the slice it waits on and
+ *           the task's own slice; `heads_up` (client 1.24.0) `held` or
+ *           `unheld` once Hive's notice said the owners' same-file switch
+ *           freed the file (hive_heads_up_learn()), with `heads_up_at`,
+ *           when the notice was sent; else absent
  *   woken   repo/key => when an agent here was told the task is free
  *   noted   wait ulid => the quiet_at an agent here was told of
  *
@@ -36148,6 +37191,15 @@ function hive_waits_shape(?array $raw, int $now): array
             // decided while lanes.json still held the override's record.
             'overridden' => ($wait['overridden'] ?? false) === true,
         ];
+        // Freed because Hive stopped holding a file two people change
+        // (client 1.24.0): `held` while the keeper still had a change there,
+        // `unheld` when not, as Hive's notice said (hive_heads_up_learn()),
+        // with when the notice was sent (`heads_up_at`); a mark without it
+        // is none.
+        if (in_array($wait['heads_up'] ?? null, ['held', 'unheld'], true) && is_int($wait['heads_up_at'] ?? null)) {
+            $out['waits'][$ulid]['heads_up'] = $wait['heads_up'];
+            $out['waits'][$ulid]['heads_up_at'] = $wait['heads_up_at'];
+        }
     }
 
     foreach (is_array($raw['woken'] ?? null) ? $raw['woken'] : [] as $task => $at) {
@@ -36883,11 +37935,17 @@ function hive_ago_words(int $seconds): string
  * and the branch is said only with $branch. $overridden (client 1.23.0,
  * fix round 1, O1): the developer's override freed it
  * (hive_waits_freed_by_override()), which Hive reports as a release, and
- * which the keeper never made.
+ * which the keeper never made. $headsUp (client 1.24.0): the owners'
+ * same-file switch freed it (hive_waits_freed_by_heads_up()), which Hive
+ * reports as `dropped`, "<keeper> stopped holding it", as if the keeper had
+ * let go, where Hive stopped holding it for whoever began first: `held`
+ * while the keeper still has their change there, `unheld` when not. Said
+ * of the release, in the past: a resume, and the session note's ready
+ * line, may come days later, after the owners flipped the switch back.
  *
  * @param  array<string, mixed>  $wait  a wait of Hive's answer
  */
-function hive_waits_freed_words(array $wait, string $noun, bool $branch, int $now, bool $overridden = false): string
+function hive_waits_freed_words(array $wait, string $noun, bool $branch, int $now, bool $overridden = false, ?string $headsUp = null): string
 {
     if (($wait['kind'] ?? 'file') === 'slice') {
         return hive_slice_freed_words($wait, $now);
@@ -36905,6 +37963,10 @@ function hive_waits_freed_words(array $wait, string $noun, bool $branch, int $no
 
     if ($overridden && ($wait['reason'] ?? null) === 'released') {
         return 'the developer\'s override freed '.$noun.$ago.' ('.$dev.' still has their change there)';
+    }
+    if (($headsUp === 'held' || $headsUp === 'unheld') && ($wait['reason'] ?? null) === 'dropped') {
+        return 'Hive stopped holding '.$noun.' for whoever began first'.$ago.', when two people changing one file became a heads-up, and '.$dev
+            .($headsUp === 'held' ? ' still has their change there' : ' has no change there now');
     }
 
     switch ($wait['reason'] ?? null) {
@@ -36975,6 +38037,72 @@ function hive_waits_freed_by_override(array $wait, array $local): bool
 }
 
 /**
+ * Client 1.24.0: was this freed file wait freed because the owners'
+ * same-file switch stopped Hive holding the file? Hive reports such a wait
+ * freed `dropped`, and tells the waiter with notice.freed, reason
+ * `heads_up` or `heads_up_unheld`, which this machine learns into its
+ * waits.json (hive_heads_up_learn()): `held` or `unheld`, the mark on the
+ * local wait (by the wait's ulid), for a file wait freed `dropped` within
+ * HIVE_HEADS_UP_FREED_WITHIN of the notice, by Hive's clock both; null for
+ * any other wait -- one freed `dropped` at another time was freed by
+ * something else, however the file was named since -- and for one freed
+ * before the notice was learnt, which keeps 1.23.0's words.
+ *
+ * @param  array<string, mixed>  $wait  a wait of Hive's answer
+ * @param  array{waits: array<string, array<string, mixed>>}  $local
+ */
+function hive_waits_freed_by_heads_up(array $wait, array $local): ?string
+{
+    if (($wait['kind'] ?? 'file') !== 'file' || ($wait['reason'] ?? null) !== 'dropped') {
+        return null;
+    }
+    $mine = $local['waits'][(string) ($wait['wait'] ?? '')] ?? [];
+    $mark = $mine['heads_up'] ?? null;
+    $at = $mine['heads_up_at'] ?? null;
+    $freed = hive_progress_parse_time($wait['freed_at'] ?? null);
+    if (($mark !== 'held' && $mark !== 'unheld') || ! is_int($at) || $freed === null || abs($freed - $at) > HIVE_HEADS_UP_FREED_WITHIN) {
+        return null;
+    }
+
+    return $mark;
+}
+
+/**
+ * Client 1.24.0: the same-file switch's word on each of a task's waits
+ * (hive_waits_freed_by_heads_up()), by the list's own keys -- and on a wait
+ * freed `dropped` alongside one it speaks for, at the same moment and from
+ * the same keeper: one release frees every wait of its run at once and its
+ * notice names one file, so a task parked on several files of a keeper is
+ * worded as one release, not as a keeper who let go of some.
+ *
+ * @param  array<int|string, mixed>  $waits  of Hive's answer
+ * @param  array{waits: array<string, array<string, mixed>>}  $local
+ * @return array<int|string, string|null>
+ */
+function hive_waits_heads_up_marks(array $waits, array $local): array
+{
+    $marks = [];
+    foreach ($waits as $i => $wait) {
+        $marks[$i] = is_array($wait) ? hive_waits_freed_by_heads_up($wait, $local) : null;
+    }
+    foreach ($waits as $i => $wait) {
+        if ($marks[$i] !== null || ! is_array($wait) || ($wait['kind'] ?? 'file') !== 'file' || ($wait['reason'] ?? null) !== 'dropped'
+            || ! is_string($wait['freed_at'] ?? null)) {
+            continue;
+        }
+        foreach ($waits as $j => $other) {
+            if ($marks[$j] !== null && is_array($other) && ($other['freed_at'] ?? null) === $wait['freed_at']
+                && ($other['login'] ?? null) === ($wait['login'] ?? null)) {
+                $marks[$i] = $marks[$j];
+                break;
+            }
+        }
+    }
+
+    return $marks;
+}
+
+/**
  * Does lanes.json hold the developer's override of what this local wait
  * waited on (hive_waits_freed_by_override()), for this freed wait of Hive's
  * answer: a file wait freed `released`, an override of the same repository
@@ -37014,7 +38142,10 @@ function hive_waits_override_holds(array $mine, array $wait): bool
  * the developer's override or not (hive_waits_freed_by_override()) -- from
  * the one freed last, as before; else wait by wait, "<file>: <how>", the
  * first three and how many more, so a teammate's push beside an override
- * is never worded as the override, nor the override as a release.
+ * is never worded as the override, nor the override as a release. Client
+ * 1.24.0: the owners' same-file switch is a way of its own, held or not
+ * (hive_waits_freed_by_heads_up()), told apart from both as they are told
+ * apart from each other.
  *
  * @param  array<string, mixed>  $task  a task of Hive's answer
  * @param  array{waits: array<string, array<string, mixed>>}  $local
@@ -37024,15 +38155,32 @@ function hive_waits_freed_summary(array $task, array $local, string $noun, bool 
     $latest = hive_waits_latest_freed($task);
     $freed = array_values(array_filter((array) ($task['waits'] ?? []), static fn ($wait): bool => is_array($wait)
         && ($wait['kind'] ?? 'file') === 'file' && ($wait['state'] ?? null) === 'freed'));
-    $by = array_map(static fn (array $wait): bool => hive_waits_freed_by_override($wait, $local), $freed);
-    if (count(array_unique($by)) <= 1) {
-        return hive_waits_freed_words($latest, $noun, $branch, $now, hive_waits_freed_by_override($latest, $local));
+    // How each was freed: by the override, by the same-file switch (held
+    // or not, a release's other waits with the one its notice named), or
+    // otherwise.
+    $marks = hive_waits_heads_up_marks($freed, $local);
+    $by = [];
+    foreach ($freed as $i => $wait) {
+        $overridden = hive_waits_freed_by_override($wait, $local);
+        $by[$i] = [$overridden, $overridden ? null : $marks[$i]];
+    }
+    $ways = array_unique(array_map(static fn (array $way): string => ($way[0] ? 'override' : '').'|'.($way[1] ?? ''), $by));
+    if (count($ways) <= 1) {
+        $overridden = hive_waits_freed_by_override($latest, $local);
+        $headsUp = null;
+        foreach ($freed as $i => $wait) {
+            if (($wait['wait'] ?? null) === ($latest['wait'] ?? false)) {
+                $headsUp = $by[$i][1];
+            }
+        }
+
+        return hive_waits_freed_words($latest, $noun, $branch, $now, $overridden, $overridden ? null : $headsUp);
     }
 
     $parts = [];
     foreach (array_slice($freed, 0, 3) as $i => $wait) {
         $label = hive_safe_text($local['waits'][(string) ($wait['wait'] ?? '')]['label'] ?? null, HIVE_SAFE_PATH_MAX);
-        $parts[] = ($label !== '' ? $label.': ' : '').hive_waits_freed_words($wait, 'it', $branch, $now, $by[$i]);
+        $parts[] = ($label !== '' ? $label.': ' : '').hive_waits_freed_words($wait, 'it', $branch, $now, $by[$i][0], $by[$i][1]);
     }
 
     return implode('; ', $parts).(count($freed) > 3 ? '; and '.(count($freed) - 3).' more' : '');
@@ -39397,7 +40545,8 @@ function hive_resume_run(array $ctx, array $schema, string $repo, string $me, st
 
     $reads = [];
     $checks = [];
-    foreach ($fileWaits as $wait) {
+    $switched = hive_waits_heads_up_marks($fileWaits, ['waits' => $mine]);
+    foreach ($fileWaits as $index => $wait) {
         $dev = hive_safe_text($wait['name'], HIVE_SAFE_NAME_MAX);
         $branch = (string) ($wait['branch'] ?? '');
         $plain = $branch !== '' && preg_match('#^[A-Za-z0-9._/@%+=:,~-]+$#', $branch) === 1 && ! str_starts_with($branch, '-');
@@ -39407,7 +40556,10 @@ function hive_resume_run(array $ctx, array $schema, string $repo, string $me, st
         // Freed by the developer's override (fix round 1, O1; per wait since
         // round 2, OW2): its keeper pushed nothing, so there is no change of
         // theirs to read for it; a teammate's push beside it still is.
-        $reads[$group]['overridden'] = $reads[$group]['overridden'] && hive_waits_freed_by_override($wait, ['waits' => $mine]);
+        // Client 1.24.0: nor for one the owners' same-file switch freed,
+        // whose keeper pushed nothing either (hive_waits_heads_up_marks()).
+        $reads[$group]['overridden'] = $reads[$group]['overridden']
+            && (hive_waits_freed_by_override($wait, ['waits' => $mine]) || ($switched[$index] ?? null) !== null);
         $kept = $mine[$wait['wait']] ?? null;
         if ($kept !== null) {
             $reads[$group]['files'][hive_fold($kept['path'])] = hive_shell_word($kept['path']);
@@ -40939,7 +42091,13 @@ function hive_take_again_out(array $restored, string $what, string $repo, string
 /**
  * A take Hive answered 409: somebody took the item first, finished it, or
  * the owners dropped it. Nothing is written. Says who has it, from Hive's
- * `by` and `since`, then asks for the list again and offers it.
+ * `by` and `since`, then asks for the list again and offers it -- but for
+ * a workplan task's lane, a claimed file, a handover, a blocked slice and a
+ * task Hive names instead, whose HIVE NEXT says what follows without the
+ * list. Client 1.24.0: a take over the owners' hold cap (holds_full) names
+ * the hold to give back and asks for no list (hive_take_holds_full()), and
+ * a task Hive names instead is the developer's pick outside autopilot for
+ * its workplan (hive_take_offer()).
  *
  * @param  array<string, string>  $ctx
  * @param  array<string, mixed>  $schema
@@ -40961,7 +42119,14 @@ function hive_take_refused(array $ctx, array $schema, string $repo, string $item
     $instead = is_array($json['instead'] ?? null) && is_string($json['instead']['repo'] ?? null) && hive_is_repo_name($json['instead']['repo'])
         && is_string($json['instead']['key'] ?? null) && hive_is_task_key($json['instead']['key']) ? $json['instead'] : null;
     $holder = hive_workplan_login($by['login'] ?? null) ?? 'a teammate';
-    $offer = $instead !== null ? 'HIVE NEXT: '.$cmd.' progress take '.$instead['repo'].' '.$instead['key'] : null;
+    // Client 1.24.0: a task Hive names is the developer's pick outside
+    // autopilot for its workplan, the next take under it (hive_take_offer()).
+    // An error words it as 1.23.0 did.
+    try {
+        $offer = hive_take_offer($json, $item, $cmd);
+    } catch (Throwable $e) {
+        $offer = $instead !== null ? 'HIVE NEXT: '.$cmd.' progress take '.$instead['repo'].' '.$instead['key'] : null;
+    }
     $prefix = strtoupper((string) strstr($item, '-', true));
     if ($code === 'not_handed') {
         // 1.12.0: a headless run's take of a task handed to it, which is
@@ -41010,6 +42175,23 @@ function hive_take_refused(array $ctx, array $schema, string $repo, string $item
             HIVE_WAITS_DATA_NOTE], $offer, 2);
     }
 
+    // Client 1.24.0: a take over the owners' hold cap (D.2's holds_full)
+    // asks Hive for no list -- nothing can be taken until a hold goes back,
+    // which is the developer's call -- and names the hold to give back
+    // (hive_take_holds_full()). An error says what 1.23.0 says, below.
+    if ($code === 'holds_full') {
+        try {
+            $full = hive_take_holds_full($json, $cmd);
+        } catch (Throwable $e) {
+            $full = null;
+        }
+        if ($full !== null) {
+            hive_progress_log('take', ['taken' => 0]);
+
+            return hive_progress_out($full[0], $full[1], 2);
+        }
+    }
+
     // A slice's refusal is Hive's own sentence (SECTION 18g). A blocked one
     // names what it waits on and what to do instead, in its HIVE NEXT: the
     // agent asks the developer, and nothing else is fetched.
@@ -41056,6 +42238,84 @@ function hive_take_refused(array $ctx, array $schema, string $repo, string $item
     $lines[] = HIVE_WAITS_DATA_NOTE;
 
     return hive_progress_out($lines, $told.substr(hive_next_hive_next($items, $cmd), strlen('HIVE NEXT: ')), 2);
+}
+
+/**
+ * Client 1.24.0: the HIVE NEXT for a task Hive names `instead` of the one
+ * refused ({repo, key}, each in its grammar): under autopilot for its
+ * workplan in this session (hive_session_autopilot() of
+ * hive_agent_session_digest(); the workplan is the refused item's key
+ * before its first `-`, else the named task's), the next take, as 1.23.0
+ * said it to every session; otherwise the developer's pick: "Hive names
+ * <repo> <KEY> as free; taking it is the developer's pick: <take>." Hive
+ * names one to a session not on autopilot only while the owners' offers
+ * switch is off (release D.2), and an offer is never a take. Null without
+ * a valid `instead`.
+ *
+ * @param  array<string, mixed>  $json  the refusal's body
+ */
+function hive_take_offer(array $json, string $item, string $cmd): ?string
+{
+    $instead = $json['instead'] ?? null;
+    if (! is_array($instead) || ! is_string($instead['repo'] ?? null) || ! hive_is_repo_name($instead['repo'])
+        || ! is_string($instead['key'] ?? null) || ! hive_is_task_key($instead['key'])) {
+        return null;
+    }
+
+    $take = $cmd.' progress take '.$instead['repo'].' '.$instead['key'];
+    $workplan = strtoupper((string) strstr(($item !== '' ? $item : $instead['key']).'-', '-', true));
+    $digest = hive_agent_session_digest();
+    if ($digest !== null && $workplan !== '' && isset(hive_session_autopilot($digest)[$workplan])) {
+        return 'HIVE NEXT: '.$take;
+    }
+
+    return 'HIVE NEXT: Hive names '.$instead['repo'].' '.$instead['key'].' as free; taking it is the developer\'s pick: '.$take.'.';
+}
+
+/**
+ * Client 1.24.0: what a take over the owners' hold cap says (409
+ * holds_full, release D.2): Hive's own sentence up to its HIVE NEXT, made
+ * this machine's (hive_slice_text()) -- the developer's holds, the cap,
+ * what counts one less -- or, with none, that Hive keeps a cap and this
+ * take is over it; then a HIVE NEXT that names the first of their holds
+ * to give back, in the grammar its command takes (`progress move <repo>
+ * <id> cancelled` for a take, `progress release <repo> <KEY>` for a lane,
+ * `scope` lanes), and `progress next` for what else is free. A first hold
+ * that fails its grammar names no command: Hive's own HIVE NEXT goes, else
+ * the sentence alone. Which hold goes back, if any, is the developer's
+ * call; no list is asked of Hive. Lines, and the HIVE NEXT.
+ *
+ * @param  array<string, mixed>  $json  the refusal's body
+ * @return array{0: list<string>, 1: string}
+ */
+function hive_take_holds_full(array $json, string $cmd): array
+{
+    $lanes = ($json['scope'] ?? null) === 'lanes';
+    [$line, $next] = hive_slice_split(hive_slice_text($json['text'] ?? null, $cmd));
+
+    $keys = $json['keys'] ?? null;
+    $first = is_array($keys) && array_is_list($keys) && is_array($keys[0] ?? null) ? $keys[0] : [];
+    $repo = is_string($first['repo'] ?? null) && hive_is_repo_name($first['repo']) ? $first['repo'] : null;
+    $key = is_string($first['key'] ?? null) ? $first['key'] : null;
+    if ($key !== null && ! ($lanes ? hive_is_task_key($key) : preg_match(HIVE_PROGRESS_ID_PATTERN, $key) === 1)) {
+        $key = null;
+    }
+
+    $what = $lanes ? 'lane' : 'hold';
+    if ($repo !== null && $key !== null) {
+        $give = $lanes ? $cmd.' progress release '.$repo.' '.$key.' gives back the lane of '.$repo.'/'.$key
+            : $cmd.' progress move '.$repo.' '.$key.' cancelled gives back '.$repo.'/'.$key;
+        $next = 'HIVE NEXT: Nothing was taken. Which '.$what.' goes back, if any, is the developer\'s call: '.$give.', and '.$cmd
+            .' progress next lists what else is free.';
+    } elseif ($next === null) {
+        $next = 'HIVE NEXT: Nothing was taken. Which '.$what.' goes back, if any, is the developer\'s call.';
+    }
+    if ($line === '') {
+        $line = $lanes ? 'Not taken: Hive keeps a cap on the lanes a session holds, and this one is over it.'
+            : 'Not taken: Hive keeps a cap on takes nobody has started, and this one is over it.';
+    }
+
+    return [[$line, HIVE_SLICE_DATA_NOTE], $next];
 }
 
 // -----------------------------------------------------------------------------
@@ -46930,7 +48190,8 @@ function hive_broker_policy(?array $cache): array
     return [
         'autonomy' => hive_enum($block['autonomy'] ?? null, HIVE_AUTONOMY_VALUES, 'off'),
         'gate' => hive_enum($block['gate'] ?? null, HIVE_GATE_MODES, 'context'),
-        'manual_repos' => array_keys($repos),
+        // Strings: a name in digits alone is an integer key, which in_array() in hive_broker_autonomy() would never match.
+        'manual_repos' => array_map('strval', array_keys($repos)),
         'watch_seconds' => is_int($block['watch_seconds'] ?? null) ? max(600, min(HIVE_BROKER_WATCH_SECONDS, $block['watch_seconds'])) : HIVE_BROKER_WATCH_SECONDS,
         'wakes_per_hour' => is_int($block['wakes_per_hour'] ?? null) ? max(0, min(60, $block['wakes_per_hour'])) : HIVE_BROKER_WAKES_PER_HOUR,
         // Client 1.18.0: the said-again pace, in seconds.
@@ -48245,6 +49506,89 @@ function hive_override_learn(array $messages): void
     hive_lanes_mutate(static function (array $local) use ($new): array {
         foreach ($new as $case => $record) {
             $local['overrides'][$case] = $local['overrides'][$case] ?? $record + ['at' => time(), 'case_only' => true];
+        }
+
+        return $local;
+    });
+}
+
+/**
+ * Learn from Hive's notices that the owners' same-file switch freed a file
+ * this machine parked on (client 1.24.0): a notice.freed whose reason is
+ * `heads_up` (the keeper still has a change there) or `heads_up_unheld`
+ * (they have none now) names, by its repository and path hash, the file
+ * the waiter's park waited on, and marks this machine's waits on it
+ * `heads_up: held|unheld` in waits.json, with the notice's time
+ * (`heads_up_at`), as hive_waits_reconcile() marks `overridden` -- not a
+ * park made after the notice, which its release cannot have freed -- so
+ * HIVE RESUME says Hive stopped holding it
+ * (hive_waits_freed_words()). Never lanes.json: the edit gate reads that
+ * on every edit and takes its overrides as the developer's word, which
+ * this is not. One write at most, and none with no waits.json or nothing
+ * new; any other reason is not read.
+ *
+ * @param  list<array<string, mixed>>  $messages  hive_broker_block()'s
+ */
+function hive_heads_up_learn(array $messages): void
+{
+    $found = [];
+    foreach ($messages as $message) {
+        $reason = $message['params']['reason'] ?? null;
+        $hash = $message['params']['path_hash'] ?? null;
+        $repo = $message['repo'] ?? null;
+        $at = hive_progress_parse_time($message['at'] ?? null);
+        if (($message['code'] ?? null) !== 'notice.freed' || ($reason !== 'heads_up' && $reason !== 'heads_up_unheld') || $at === null
+            || ! is_string($hash) || ! hive_is_hash(strtolower($hash)) || ! is_string($repo) || ! hive_is_repo_name(strtolower($repo))) {
+            continue;
+        }
+        $found[strtolower($repo).'|'.strtolower($hash)] = ['mark' => $reason === 'heads_up' ? 'held' : 'unheld', 'at' => $at];
+    }
+    if ($found === [] || ! is_file(hive_waits_file('waits.json'))) {
+        return;
+    }
+
+    // The waits on the file a notice names, and every other wait on that
+    // keeper's files in the repository: one release frees them all at one
+    // moment and its notice names one file, so another task parked on the
+    // keeper is marked too, and the mark speaks only for a wait Hive freed
+    // by that moment (hive_waits_freed_by_heads_up()). A park made after
+    // the notice was not freed by its release; its time is this machine's
+    // clock against Hive's, and a skewed one falls back to 1.23.0's words.
+    $marks = static function (array $local) use ($found): array {
+        // Two notices on one keeper in a repository that disagree (one
+        // release per branch of the waiter's) leave that keeper's other
+        // waits unmarked: each takes its own task's word at reading
+        // (hive_waits_heads_up_marks()), or 1.23.0's.
+        $keepers = [];
+        foreach ($local['waits'] as $wait) {
+            $notice = $found[strtolower((string) $wait['repo']).'|'.strtolower((string) ($wait['hash'] ?? ''))] ?? null;
+            if ($wait['kind'] === 'file' && $notice !== null && is_string($wait['login']) && $wait['login'] !== '') {
+                $keeper = strtolower((string) $wait['repo']).'|'.strtolower($wait['login']);
+                $keepers[$keeper] = array_key_exists($keeper, $keepers) && $keepers[$keeper] !== $notice ? null : $notice;
+            }
+        }
+        $marked = [];
+        foreach ($local['waits'] as $ulid => $wait) {
+            $notice = $found[strtolower((string) $wait['repo']).'|'.strtolower((string) ($wait['hash'] ?? ''))]
+                ?? $keepers[strtolower((string) $wait['repo']).'|'.strtolower((string) ($wait['login'] ?? ''))] ?? null;
+            if ($wait['kind'] !== 'file' || $notice === null || (int) $wait['parked_at'] > $notice['at']) {
+                continue;
+            }
+            if (($wait['heads_up'] ?? null) !== $notice['mark'] || ($wait['heads_up_at'] ?? null) !== $notice['at']) {
+                $marked[(string) $ulid] = $notice;
+            }
+        }
+
+        return $marked;
+    };
+    if ($marks(hive_waits_local()) === []) {
+        return;
+    }
+
+    hive_waits_mutate(static function (array $local) use ($marks): array {
+        foreach ($marks($local) as $ulid => $notice) {
+            $local['waits'][$ulid]['heads_up'] = $notice['mark'];
+            $local['waits'][$ulid]['heads_up_at'] = $notice['at'];
         }
 
         return $local;
@@ -53029,7 +54373,17 @@ function hive_takeover_not_yet(array $json, string $cmd): int
     $instead = is_array($json['instead'] ?? null) && is_string($json['instead']['repo'] ?? null) && hive_is_repo_name($json['instead']['repo'])
         && is_string($json['instead']['key'] ?? null) && hive_is_task_key($json['instead']['key']) ? $json['instead'] : null;
     $next = ($json['next'] ?? null) !== null ? hive_broker_next_line($json['next'], $cmd) : null;
-    $next = $next ?? ($instead !== null ? 'HIVE NEXT: '.$cmd.' progress take '.$instead['repo'].' '.$instead['key'] : 'HIVE NEXT: '.hive_next_work_line('', ''));
+    // Client 1.24.0: a task Hive names instead is the developer's pick
+    // outside autopilot for its workplan (hive_take_offer()); an error words
+    // it as 1.23.0 did.
+    if ($next === null) {
+        try {
+            $next = hive_take_offer($json, '', $cmd);
+        } catch (Throwable $e) {
+            $next = $instead !== null ? 'HIVE NEXT: '.$cmd.' progress take '.$instead['repo'].' '.$instead['key'] : null;
+        }
+    }
+    $next = $next ?? 'HIVE NEXT: '.hive_next_work_line('', '');
 
     return hive_progress_out(['Not taken over: '.$why.'.'.($at !== null ? ' A takeover may come at '.gmdate('H:i', $at).' UTC.' : '')], $next, 2);
 }
@@ -54362,6 +55716,12 @@ function hive_progress_verb_inbox(array $args): int
             // Client 1.23.0: what the developer's override freed, learnt.
             try {
                 hive_override_learn($read['messages']);
+            } catch (Throwable $e) {
+                // The next answer says it again.
+            }
+            // Client 1.24.0: what the owners' same-file switch freed, learnt.
+            try {
+                hive_heads_up_learn($read['messages']);
             } catch (Throwable $e) {
                 // The next answer says it again.
             }
@@ -55849,6 +57209,12 @@ function hive_broker_cache_block(array &$cache, $raw, ?string $branch): void
     // Client 1.23.0: what the developer's override freed, learnt.
     try {
         hive_override_learn($block['messages']);
+    } catch (Throwable $e) {
+        // The next block says it again.
+    }
+    // Client 1.24.0: what the owners' same-file switch freed, learnt.
+    try {
+        hive_heads_up_learn($block['messages']);
     } catch (Throwable $e) {
         // The next block says it again.
     }
@@ -60085,9 +61451,11 @@ function hive_broker_gate_refusal(string $name, string $shown, string $relative,
  * heartbeat took them, at most HIVE_BROKER_GATE_SAMPLES_MAX samples, and the
  * push requests left for a flush (at most HIVE_BROKER_ASKS_MAX, none older
  * than HIVE_BROKER_ASK_WINDOW, whatever the policy's said-again pace).
+ * Client 1.24.0: the heads-up lines said (hive_heads_up_count()), at most
+ * HIVE_HEADS_UP_COUNT_MAX.
  *
  * @param  array<string, mixed>  $raw
- * @return array{would_deny: int, denied: int, samples: list<array<string, mixed>>, asks: array<string, array<string, mixed>>}
+ * @return array{would_deny: int, denied: int, samples: list<array<string, mixed>>, asks: array<string, array<string, mixed>>, heads_up: int}
  */
 function hive_broker_gate_shape(array $raw, int $now): array
 {
@@ -60110,13 +61478,21 @@ function hive_broker_gate_shape(array $raw, int $now): array
         'denied' => is_int($raw['denied'] ?? null) ? max(0, $raw['denied']) : 0,
         'samples' => $samples,
         'asks' => $asks,
+        'heads_up' => is_int($raw['heads_up'] ?? null) ? max(0, min(HIVE_HEADS_UP_COUNT_MAX, $raw['heads_up'])) : 0,
     ];
 }
 
-/** broker-gate.json with nothing in it is no file at all. */
+/**
+ * broker-gate.json with nothing in it is no file at all; with no heads-up
+ * line counted it holds no `heads_up`, as 1.23.0 wrote it.
+ */
 function hive_broker_gate_doc(array $doc): array
 {
-    return $doc['would_deny'] === 0 && $doc['denied'] === 0 && $doc['samples'] === [] && $doc['asks'] === [] ? [] : $doc;
+    if (($doc['heads_up'] ?? 0) === 0) {
+        unset($doc['heads_up']);
+    }
+
+    return $doc['would_deny'] === 0 && $doc['denied'] === 0 && $doc['samples'] === [] && $doc['asks'] === [] && ! isset($doc['heads_up']) ? [] : $doc;
 }
 
 /**
@@ -60154,22 +61530,48 @@ function hive_broker_gate_count(string $stage, array $sample, int $now): void
 }
 
 /**
+ * Client 1.24.0: counts $lines heads-up lines said to this machine's agents
+ * (hive_gate_heads_up(), hive_heads_up_note()), for the next heartbeat to
+ * carry as `gate.heads_up`, which Hive records as broker.heads_up_said: a
+ * number, never what was said, of which file or to whom. Under the gate's
+ * own lock wait (HIVE_BROKER_GATE_WAIT): a count that cannot be had in time
+ * is not counted, and nothing waits on it.
+ */
+function hive_heads_up_count(int $lines): void
+{
+    if ($lines <= 0) {
+        return;
+    }
+
+    hive_broker_state_mutate('broker-gate', static function (array $raw) use ($lines): array {
+        $doc = hive_broker_gate_shape($raw, time());
+        $doc['heads_up'] = min(HIVE_HEADS_UP_COUNT_MAX, $doc['heads_up'] + $lines);
+
+        return hive_broker_gate_doc($doc);
+    }, HIVE_BROKER_GATE_WAIT);
+}
+
+/**
  * What the next heartbeat sends as `gate` (docs/api/broker.md), and clears:
- * {would_deny, denied, samples}, or null with nothing counted.
+ * {would_deny, denied, samples}, or null with nothing counted. Client
+ * 1.24.0: and `heads_up`, the heads-up lines said, only when there is one;
+ * a report of those alone is sent with the other two at 0.
  *
- * @return array{would_deny: int, denied: int, samples: list<array<string, mixed>>}|null
+ * @return array{would_deny: int, denied: int, samples: list<array<string, mixed>>, heads_up?: int}|null
  */
 function hive_broker_gate_report(): ?array
 {
     $report = null;
     hive_broker_state_mutate('broker-gate', static function (array $raw) use (&$report): array {
         $doc = hive_broker_gate_shape($raw, time());
-        if ($doc['would_deny'] > 0 || $doc['denied'] > 0) {
-            $report = ['would_deny' => $doc['would_deny'], 'denied' => $doc['denied'], 'samples' => $doc['samples']];
+        if ($doc['would_deny'] > 0 || $doc['denied'] > 0 || $doc['heads_up'] > 0) {
+            $report = ['would_deny' => $doc['would_deny'], 'denied' => $doc['denied'], 'samples' => $doc['samples']]
+                + ($doc['heads_up'] > 0 ? ['heads_up' => $doc['heads_up']] : []);
         }
         $doc['would_deny'] = 0;
         $doc['denied'] = 0;
         $doc['samples'] = [];
+        $doc['heads_up'] = 0;
 
         return hive_broker_gate_doc($doc);
     }, HIVE_BROKER_STATE_WAIT);
@@ -60181,7 +61583,7 @@ function hive_broker_gate_report(): ?array
  * Puts back a report a heartbeat that failed could not deliver, so the next
  * one carries it.
  *
- * @param  array{would_deny: int, denied: int, samples: list<array<string, mixed>>}  $report
+ * @param  array{would_deny: int, denied: int, samples: list<array<string, mixed>>, heads_up?: int}  $report
  */
 function hive_broker_gate_restore(array $report): void
 {
@@ -60190,6 +61592,7 @@ function hive_broker_gate_restore(array $report): void
         $doc['would_deny'] += $report['would_deny'];
         $doc['denied'] += $report['denied'];
         $doc['samples'] = array_slice(array_merge($report['samples'], $doc['samples']), 0, HIVE_BROKER_GATE_SAMPLES_MAX);
+        $doc['heads_up'] = min(HIVE_HEADS_UP_COUNT_MAX, $doc['heads_up'] + (is_int($report['heads_up'] ?? null) ? max(0, $report['heads_up']) : 0));
 
         return hive_broker_gate_doc($doc);
     }, HIVE_BROKER_STATE_WAIT);
@@ -60496,6 +61899,12 @@ function hive_broker_waits_keep($raw): void
     // Client 1.23.0: what the developer's override freed, learnt.
     try {
         hive_override_learn($block['messages']);
+    } catch (Throwable $e) {
+        // The next poll says it again.
+    }
+    // Client 1.24.0: what the owners' same-file switch freed, learnt.
+    try {
+        hive_heads_up_learn($block['messages']);
     } catch (Throwable $e) {
         // The next poll says it again.
     }
