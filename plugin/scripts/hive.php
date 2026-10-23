@@ -396,7 +396,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.24.0';
+const HIVE_VERSION = '1.24.1';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -1408,12 +1408,15 @@ const HIVE_WOKEN_MAX = 200;
 const HIVE_HEADS_UP_MAX = 200;
 
 /*
-| Client 1.24.0: past this many files of one teammate in one repository --
-| the marks the session holds of them and the files a flush note adds -- the
-| session remembers that teammate's files there as a whole -- one mark, the
-| latest `since` said (hive_heads_up_wide_mark()) -- not a mark a file: a
-| pair sharing hundreds of files would otherwise fill HIVE_HEADS_UP_MAX at
-| once, and so would a claim that grows a few files at every publish.
+| Client 1.24.0: past this many files of one teammate in one repository in
+| one flush note, the session remembers that teammate's files there as a
+| whole -- one mark, the latest `since` said (hive_heads_up_wide_mark()) --
+| not a mark a file: a pair sharing hundreds of files would otherwise fill
+| HIVE_HEADS_UP_MAX at once. Only the note's own files count (client
+| 1.24.1): a claim that grows a few files at every publish keeps a mark a
+| file, each with a later `since`, until the map is full and
+| hive_heads_up_bound() folds a teammate; folding it earlier hid every later
+| file of the claim whose `since` fell under the fold's.
 */
 const HIVE_HEADS_UP_WIDE = 20;
 
@@ -10560,6 +10563,7 @@ function hive_pause_probe(string $host): bool
         return $state;
     });
 
+    $asked = time();
     hive_pause_probing(true);
     try {
         $response = hive_http('GET', '/policy', null, 'flush');
@@ -10576,7 +10580,7 @@ function hive_pause_probe(string $host): bool
         return false;
     }
 
-    hive_policy_apply($json);
+    hive_policy_apply($json, $asked);
     hive_breaker_success($host);
 
     return true;
@@ -10588,11 +10592,13 @@ function hive_pause_probe(string $host): bool
  * each. Only the policy changes; the team picture keeps its age, so the gate
  * trusts it for exactly as long as before. The whole policy GET /policy
  * served replaces what each cache held, and a pause hold with it: the
- * server has just said whether it is paused.
+ * server has just said whether it is paused. Each is stamped (`policy_at`)
+ * with the second the request was sent, $askedAt (client 1.24.1), or when
+ * it is applied where the caller has none.
  *
  * @param  array<string, mixed>  $policy
  */
-function hive_policy_apply(array $policy): void
+function hive_policy_apply(array $policy, ?int $askedAt = null): void
 {
     unset($policy['object']);
 
@@ -10605,7 +10611,7 @@ function hive_policy_apply(array $policy): void
         $current = is_array($cache['policy'] ?? null) ? $cache['policy'] : [];
         if ($policy !== $current || isset($cache['paused_until'])) {
             $cache['policy'] = $policy;
-            $cache['policy_at'] = time();
+            $cache['policy_at'] = $askedAt !== null ? min($askedAt, time()) : time();
             unset($cache['paused_until']);
             hive_write_json($file, $cache);
         }
@@ -14188,7 +14194,10 @@ function hive_same_file_mode(?array $cache): ?string
  * edits is told, and a later one reaches it in the flush's grouped note
  * after the publish, so a claim of hundreds of files puts one line in the
  * agent's context, not one at every edit. A file the session heard of from
- * that teammate already, in a flush's note, is not told again either. The
+ * that teammate already, in a flush's note, is not told again either, though
+ * the map has since folded its mark into the teammate's wide mark (client
+ * 1.24.1: the picture holds the overlap, its `since` no later than the wide
+ * mark's). The
  * marks -- the claim's (hive_heads_up_claim_mark()) and the file's
  * (hive_heads_up_mark()), `gate:<claim>` their episode -- go in the session
  * file's `heads_up` map under its write lock, waited for
@@ -14227,10 +14236,24 @@ function hive_gate_heads_up(string $sessionId, array $session, array $input, arr
 
     $claimMark = hive_heads_up_claim_mark($repo, $id);
     $fileMark = hive_heads_up_mark($repo, $relative, $who);
-    $heard = static function (array $session) use ($claimMark, $fileMark): bool {
+    $wideMark = hive_heads_up_wide_mark($repo, $who);
+    $heard = static function (array $session) use ($claimMark, $fileMark, $wideMark, $cache, $repo, $who): bool {
         $marks = is_array($session['heads_up'] ?? null) ? $session['heads_up'] : [];
+        if (array_key_exists($claimMark, $marks) || array_key_exists($fileMark, $marks)) {
+            return true;
+        }
 
-        return array_key_exists($claimMark, $marks) || array_key_exists($fileMark, $marks);
+        // A file mark the flush wrote may have been folded into the
+        // teammate's wide mark since (hive_heads_up_bound()): the file is
+        // heard when the picture holds this overlap and its `since` is no
+        // later than the one the wide mark says.
+        $wide = $marks[$wideMark] ?? null;
+        if (! is_string($wide) || $wide === '' || str_starts_with($wide, 'gate:')) {
+            return false;
+        }
+        $since = hive_heads_up_overlap_since($cache, $repo, $fileMark, $who);
+
+        return $since !== null && hive_since_later($wide, $since);
     };
     if ($heard($session)) {
         return null;
@@ -14367,13 +14390,42 @@ function hive_heads_up_claim_mark(string $slug, string $claimId): string
 
 /**
  * Client 1.24.0: the key a teammate's files in a repository are kept under
- * as a whole, once a flush said more than HIVE_HEADS_UP_WIDE of them, or
- * the map was full: `wide:` and the teammate's key
+ * as a whole, once one flush note said more than HIVE_HEADS_UP_WIDE of them,
+ * or the map was full: `wide:` and the teammate's key
  * (hive_heads_up_teammate()), its episode the latest `since` said.
  */
 function hive_heads_up_wide_mark(string $slug, string $who): string
 {
     return 'wide:'.hive_heads_up_teammate($slug, $who);
+}
+
+/**
+ * Client 1.24.1: the `since` of a teammate's overlap with a file in a
+ * repository's picture, the file's mark being $fileMark (the gate's): the
+ * latest of their conflicts there. Null when the picture holds none; ''
+ * when it holds one that sends no `since`. For the gate to tell whether
+ * the teammate's wide mark (hive_heads_up_wide_mark()) speaks for the file.
+ *
+ * @param  array<string, mixed>  $cache
+ */
+function hive_heads_up_overlap_since(array $cache, string $slug, string $fileMark, string $who): ?string
+{
+    $found = null;
+    foreach ((array) ($cache['conflicts'] ?? []) as $conflict) {
+        if (! is_array($conflict) || hive_fold(hive_conflict_who($conflict)) !== hive_fold($who)) {
+            continue;
+        }
+        $scope = hive_str($conflict['scope'] ?? null);
+        if ($scope === null || hive_heads_up_mark($slug, $scope, $who) !== $fileMark) {
+            continue;
+        }
+        $since = hive_str($conflict['since'] ?? null) ?? '';
+        if ($found === null || hive_since_later($since, $found)) {
+            $found = $since;
+        }
+    }
+
+    return $found;
 }
 
 /**
@@ -16545,13 +16597,13 @@ function hive_noted_once(string $sessionId, array $lines): array
  * (`gate:<claim>` for one of its claims) takes the picture's `since` and is
  * not said again, one heard for this `since` or a later one is passed over,
  * and each one said is marked with its `since` -- past HIVE_HEADS_UP_WIDE
- * files of one teammate, counting the marks the session holds of them as
- * well as this note's, their files there as a whole, one mark with the
- * latest `since` (hive_heads_up_wide_mark()) their file marks are folded
- * into, so a pair sharing hundreds of files, or a claim that grows a few
- * files at every publish, fills no map and hears no file twice. The map
- * keeps HIVE_HEADS_UP_MAX marks, folding rather than dropping what is over
- * it (hive_heads_up_bound()). The line is made before
+ * files of one teammate in this note, their files there as a whole, one
+ * mark with the latest `since` (hive_heads_up_wide_mark()) their file
+ * marks are folded into, so a pair sharing hundreds of files fills no map;
+ * a claim that grows a few files at every publish is said a file at a
+ * time, and hears no file twice. The map keeps HIVE_HEADS_UP_MAX marks,
+ * folding rather than dropping what is over it, a teammate at a time
+ * (hive_heads_up_bound()). The line is made before
  * the marks are written and said only once they are. With $speak false --
  * something else spoke this batch, or the flush is a sub-agent's -- nothing
  * is said or marked said, and the gate's marks are still adopted. Null while
@@ -16696,20 +16748,17 @@ function hive_heads_up_note(string $sessionId, array $session, bool $speak = tru
         $words = $said !== [] || $switch !== null ? hive_heads_up_words($said, $first, $switch) : null;
 
         // Marked said: a file at a time, or past HIVE_HEADS_UP_WIDE files of
-        // a teammate's in all -- the marks the session holds of them and the
-        // files of this note, however many notes it took -- their files
-        // there as a whole, with the latest `since` said (their file marks
-        // folded into it), and each claim of theirs those files are in, so
-        // the gate tells none of them again either.
+        // a teammate's in this note, their files there as a whole, with the
+        // latest `since` said (their file marks folded into it), and each
+        // claim of theirs those files are in, so the gate tells none of them
+        // again either. Only this note's own files count, not the marks the
+        // session holds of them already: a claim that grows a few files a
+        // flush, each with a later `since`, is said a file at a time until
+        // the map is full (hive_heads_up_bound() folds then), where folding
+        // it at the second flush hid every later file whose `since` fell
+        // under the fold's.
         foreach ($said as $group) {
-            $prefix = 'f:'.$group['teammate'].':';
-            $known = array_fill_keys(array_keys($group['marks']), true);
-            foreach ($marks as $mark => $episode) {
-                if (str_starts_with((string) $mark, $prefix)) {
-                    $known[(string) $mark] = true;
-                }
-            }
-            if (count($known) > HIVE_HEADS_UP_WIDE) {
+            if (count($group['files']) > HIVE_HEADS_UP_WIDE) {
                 $marks = hive_heads_up_collapse($marks, $group['teammate'], $group['since']);
                 foreach ($group['ids'] as $id) {
                     if (hive_is_ulid($id)) {
@@ -20821,10 +20870,13 @@ function hive_merge_snapshot(string $repo, array $json, ?array $previous, bool $
     // Client 1.24.0: when this policy came (`policy_at`), apart from the
     // picture's `fetched_at`, which a `check` moves with no policy: the
     // newest word on the owners' same-file switch is the newest policy, not
-    // the newest picture (hive_same_file_policy()).
+    // the newest picture (hive_same_file_policy()). Client 1.24.1: the
+    // second the request was sent ($askedAt, never ahead of the clock), not
+    // the second the answer was merged: an answer to an older request that
+    // is merged late is an older policy, and must not outrank a newer one.
     if ($policy !== null) {
         $cache['policy'] = $policy;
-        $cache['policy_at'] = time();
+        $cache['policy_at'] = $askedAt !== null ? min($askedAt, time()) : time();
     }
 
     // A PUT /claims without a picture still carries the ruling on the claim
@@ -25841,8 +25893,8 @@ function hive_same_file_line(array $caches): ?string
 
 /**
  * Client 1.24.0: the team's policy that knows the owners' same-file switch
- * and came last (`policy_at`, when a heartbeat or GET /policy brought it,
- * hive_merge_snapshot()) among the live pictures of $caches (fresh or
+ * and came last (`policy_at`, when the request of the heartbeat or GET
+ * /policy that brought it was sent, hive_merge_snapshot()) among the live pictures of $caches (fresh or
  * warm), or null: what hive_same_file_line() and hive_heads_up_note() read
  * the switch by, so a note never says a file is a heads-up beside a line
  * that says it is held. Not the newest picture's: a `check` merges its
