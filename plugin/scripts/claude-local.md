@@ -1,4 +1,4 @@
-<!-- velu-hive client 1.24.1 -->
+<!-- velu-hive client 1.24.2 -->
 <!--
   CLAUDE.local.md -- personal, per-machine, NOT COMMITTED.
 

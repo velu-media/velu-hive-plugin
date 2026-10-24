@@ -396,7 +396,7 @@ if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
     exit(0);
 }
 
-const HIVE_VERSION = '1.24.1';
+const HIVE_VERSION = '1.24.2';
 
 /*
 | Default base URL. Overridable with HIVE_URL, mostly so `doctor` can be pointed
@@ -2033,6 +2033,16 @@ const HIVE_PLAN_SYNC_EVERY = 600;
 const HIVE_PLAN_SYNC_ROOT = 'docs/superpowers';
 const HIVE_PLAN_PUSHED_RECHECK = 60;
 const HIVE_PLAN_WANTS_MAX = 20;
+
+/**
+ * How long a plan Hive refused is not sent again, unchanged, when Hive asks
+ * for it (a board links it): a day, so a server that has since learned to
+ * read it gets it within one.
+ */
+const HIVE_PLAN_SYNC_REFUSED_TTL = 86_400;
+
+/** The most refused plans plan-sync remembers for one workspace. */
+const HIVE_PLAN_SYNC_REFUSED_MAX = 200;
 const HIVE_PLAN_SYNC_COST_PER_MINUTE = 120;
 const HIVE_PLAN_SYNC_CAPTURE_COST = 5;
 const HIVE_PLAN_SYNC_MINUTE_SHARE = 5;
@@ -9407,6 +9417,15 @@ function hive_http_observe(string $host, array $result, string $method = '', str
         // estimate over a maximum the owner lowered, say): it clears what was
         // refused and sends the rest, and a new client would not help.
         if (str_starts_with((string) (parse_url($path, PHP_URL_PATH) ?? ''), '/progress/runs/')) {
+            return;
+        }
+
+        // Nor is a plan Hive cannot read as one (workplan_refused: no tasks,
+        // a loop it states, too many tasks): the document's to mend, and
+        // plan-sync sets it aside until it changes. One such plan in a
+        // workspace told this machine every day that its client was out of
+        // date (24 Oct 2026).
+        if (($json['code'] ?? null) === 'workplan_refused') {
             return;
         }
 
@@ -50248,13 +50267,17 @@ function hive_plan_document_problem(string $bytes, int $max): ?string
 
 /**
  * Whether $text carries a plan marker: a `### Task N` heading (or the
- * team's `## Task N [repo] ...`), a `## T-n` heading, a PROGRESS item block
- * (`## <id> — <title>` with its `repos:` field), or front matter
- * `type: plan`.
+ * team's `## Task N [repo] ...`, or `#### Task N` under a wave), a `## T-n`
+ * heading, a task headed by its id under a `## Tasks` heading (`### K1
+ * [velu-kmp] Title`, `### TS2 — Title`), a PROGRESS item block (`## <id> —
+ * <title>` with its `repos:` field), or front matter `type: plan`. Hive
+ * reads the plan; this only says whether it is worth sending.
  */
 function hive_plan_has_marker(string $text): bool
 {
-    return preg_match('/^#{2,3}[ \t]+Task[ \t]+\d+\b/m', $text) === 1
+    return preg_match('/^#{2,4}[ \t]+Task[ \t]+\d+\b/m', $text) === 1
+        || (preg_match('/^##[ \t]+Tasks\b/mi', $text) === 1
+            && preg_match('/^#{3,4}[ \t]+(?:(?=[A-Za-z0-9.-]*\d)[A-Z][A-Za-z0-9]{0,7}(?:[.-][A-Za-z0-9]{1,8}){0,4}|[A-Z]{2,12}(?:-[A-Z0-9]{1,16}){1,5})(?![\w.-])(?:[ \t]*+(?:[\[{:\/,&]|\x{2014}|\x{2013}|\x{2026}|-[ \t]|$)|[ \t]+and[ \t])/mu', $text) === 1)
         || preg_match('/^##[ \t]+T-\d+\b/m', $text) === 1
         || (preg_match('/^##[ \t]+[A-Za-z][A-Za-z0-9-]*[ \t]+\x{2014}[ \t]+\S/mu', $text) === 1
             && preg_match('/^[ \t]*[-*][ \t]+repos:/m', $text) === 1)
@@ -50757,7 +50780,8 @@ function hive_workplan_sync(string $workspace, float $deadline): array
     // stop: at the first document Hive does not take.
     $left = hive_plan_sync_send_max($cache);
     $stopped = null;
-    $done = hive_workplan_sync_send($ws, $repo, $remote, $changed, $max, $deadline, $counts, $wants, $left, $stopped);
+    $refused = [];
+    $done = hive_workplan_sync_send($ws, $repo, $remote, $changed, $max, $deadline, $counts, $wants, $left, $stopped, $refused);
 
     // The plans Hive asked for, in this same run: this workspace's own plan
     // files only, at most HIVE_PLAN_WANTS_MAX.
@@ -50771,8 +50795,15 @@ function hive_workplan_sync(string $workspace, float $deadline): array
     }
     if ($wanted !== []) {
         $found = [];
+        $now = time();
         foreach (hive_workplan_ls_tree($ws, $remote['full'], array_values($wanted)) as $path => $blob) {
             $source = hive_plan_source_key($repo, $path);
+            // Hive asks again for a plan it refused, as long as a board links
+            // it: the same text is not sent again within a day of the refusal.
+            $was = $kept['refused'][$source] ?? null;
+            if (is_array($was) && $was['blob'] === $blob['blob'] && (int) $was['at'] <= $now && $now - (int) $was['at'] < HIVE_PLAN_SYNC_REFUSED_TTL) {
+                continue;
+            }
             if (isset($wanted[$source]) && ! isset($done[$source])) {
                 $found[$source] = ['path' => $path] + $blob;
             }
@@ -50780,16 +50811,25 @@ function hive_workplan_sync(string $workspace, float $deadline): array
         $counts['wanted'] = count($found);
         $laterBefore = $counts['later'];
         $ignored = [];
-        $done += hive_workplan_sync_send($ws, $repo, $remote, $found, $max, $deadline, $counts, $ignored, $left, $stopped);
+        $done += hive_workplan_sync_send($ws, $repo, $remote, $found, $max, $deadline, $counts, $ignored, $left, $stopped, $refused);
         // A plan the cap left for the next run was not sent now: the report does not count it.
         $counts['wanted'] = max(0, $counts['wanted'] - ($counts['later'] - $laterBefore));
     }
 
-    hive_plan_sync_mutate(static function (array $sync) use ($key, $done, $wanted, $remote, $again, $max, $judgedNow): array {
+    hive_plan_sync_mutate(static function (array $sync) use ($key, $done, $wanted, $remote, $again, $max, $judgedNow, $refused): array {
         $entry = $sync['workspaces'][$key] ?? ['blobs' => [], 'wanted' => [], 'max' => null];
+        $entry['refused'] = is_array($entry['refused'] ?? null) ? $entry['refused'] : [];
         foreach ($done as $source => $blob) {
             $entry['blobs'][$source] = $blob;
+            if (isset($refused[$source])) {
+                $entry['refused'][$source] = ['blob' => $blob, 'at' => time()];
+            } else {
+                unset($entry['refused'][$source]);
+            }
         }
+        // The newest refusals kept, at most HIVE_PLAN_SYNC_REFUSED_MAX.
+        uasort($entry['refused'], static fn (array $a, array $b): int => $b['at'] <=> $a['at']);
+        $entry['refused'] = array_slice($entry['refused'], 0, HIVE_PLAN_SYNC_REFUSED_MAX, true);
         // Judged under $max from now on: one read again but not done this
         // run (the cap left it for later, Hive did not take it) is no longer
         // kept as done, so the next run reads it as never sent.
@@ -50839,7 +50879,7 @@ function hive_workplan_sync(string $workspace, float $deadline): array
  * @return array<string, string>
  */
 function hive_workplan_sync_send(string $ws, string $repo, array $remote, array $changed, int $max, float $deadline, array &$counts, array &$wants,
-    int &$left, ?string &$stopped): array
+    int &$left, ?string &$stopped, array &$refused): array
 {
     $done = [];
     $small = [];
@@ -50898,6 +50938,7 @@ function hive_workplan_sync_send(string $ws, string $repo, array $remote, array 
             }
         } elseif (($answer['code'] ?? null) === 'workplan_refused' || ($answer['status'] ?? null) === 422) {
             $done[$source] = $entry['blob'];
+            $refused[$source] = true;
             $counts['refused']++;
         } else {
             $counts['declined']++;
@@ -51103,11 +51144,19 @@ function hive_plan_sync_shape(?array $raw): array
                 $wanted[(string) $source] = $path;
             }
         }
+        $refused = [];
+        foreach (is_array($entry['refused'] ?? null) ? $entry['refused'] : [] as $source => $was) {
+            if (hive_is_hash((string) $source) && is_array($was) && is_string($was['blob'] ?? null) && hive_is_sha($was['blob'])
+                && is_int($was['at'] ?? null) && count($refused) < HIVE_PLAN_SYNC_REFUSED_MAX) {
+                $refused[(string) $source] = ['blob' => $was['blob'], 'at' => $was['at']];
+            }
+        }
         $out[(string) $key] = [
             'synced_at' => is_int($entry['synced_at'] ?? null) ? $entry['synced_at'] : 0,
             'commit' => is_string($entry['commit'] ?? null) && hive_is_sha($entry['commit']) ? $entry['commit'] : null,
             'blobs' => $blobs,
             'wanted' => $wanted,
+            'refused' => $refused,
             'max' => is_int($entry['max'] ?? null) && $entry['max'] >= 1024 && $entry['max'] <= HIVE_PLAN_DOC_MAX ? $entry['max'] : null,
         ];
     }
